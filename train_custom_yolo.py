@@ -9,7 +9,7 @@ def main():
     # Data & IO
     p.add_argument("--yaml", default="datasets/traffic/traffic.yaml",
                    help="Path to YOLO-style dataset YAML (train/val/test, class names).")
-    p.add_argument("--out", default="runs/custom_yolo_like",
+    p.add_argument("--out", default="runs/custom_yolo",
                    help="Directory to save checkpoints and final model.")
     p.add_argument("--cache", action="store_true",
                    help="Cache tf.data pipeline in RAM (use for subsets, not full 70GB).")
@@ -74,13 +74,13 @@ if __name__ == "__main__":
     main()
 
 # Cosine (Ultralytics-style) + AdamW + grid 32
-# python train_custom_yolo.py --yaml datasets/traffic/traffic.yaml \
-  --sched cosine --img 512 --grid 32 --batch 80 --epochs 10 --limit 20000 \
-  --lr0 1e-3 --lrf 0.01 --warmup_epochs 3 --patience 6 \
-  --optimizer adamw --wd 0.01
+#python train_custom_yolo.py --yaml datasets/traffic/traffic.yaml \
+#  --sched cosine --img 512 --grid 32 --batch 80 --epochs 10 --limit 20000 \
+#  --lr0 1e-3 --lrf 0.01 --warmup_epochs 3 --patience 6 \
+#  --optimizer adamw --wd 0.01
 
 # One-cycle + AdamW + grid 24
-# python train_custom_yolo.py --yaml datasets/traffic/traffic.yaml \
-  --sched onecycle --img 512 --grid 24 --batch 80 --epochs 10 --limit 20000 \
-  --max_lr 1e-3 --div 25 --final_div 1e4 --pct_start 0.3 --patience 6 \
-  --optimizer adamw --wd 0.01
+#python train_custom_yolo.py --yaml datasets/traffic/traffic.yaml \
+#  --sched onecycle --img 512 --grid 24 --batch 80 --epochs 10 --limit 20000 \
+#  --max_lr 1e-3 --div 25 --final_div 1e4 --pct_start 0.3 --patience 6 \
+#  --optimizer adamw --wd 0.01
