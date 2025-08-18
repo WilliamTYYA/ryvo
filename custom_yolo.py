@@ -450,7 +450,7 @@ def train_cli(yaml_path: str,
         keras.callbacks.TerminateOnNaN()
     ]
 
-    model.fit(train_ds, validation_data=val_ds, epochs=epochs, callbacks=callbacks, verbose=2)
+    model.fit(train_ds, validation_data=val_ds, epochs=epochs, callbacks=callbacks, verbose=1)
 
     final_path = os.path.join(out_path, f"model_{img_size}_{grid_size}_2scale.keras")
     model.save(final_path)

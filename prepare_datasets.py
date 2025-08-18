@@ -1,593 +1,468 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 """
-prepare_datasets_clean.py
-==========================
+prepare_datasets.py
+- Build a unified YOLO detection dataset from:
+  * MTSD (Mapillary Traffic Sign Dataset)  -> traffic signs
+  * BDD100K                                 -> people/vehicles + traffic-light (red/yellow/green)
+- Optional: export lane masks from BDD100K (--export_lanes) for a future segmentation model.
+- Uses symlinks for images; does NOT move your originals.
 
-This script extracts bounding boxes from four road‑scene datasets (LISA Traffic Sign,
-Bosch Small Traffic Lights Dataset (BSTLD), Mapillary Traffic Sign Dataset (MTSD), and
-BDD100K) and writes them into the YOLO format expected by Ultralytics.
+Outputs:
+datasets/traffic/
+  images/{train,val,test}/*.jpg|.png
+  labels/{train,val,test}/*.txt        # YOLO (cls cx cy w h)
 
-The implementation here is intentionally simple and tailored to the directory structures
-shown in the provided screenshots.  It avoids the heuristics and wildcards of the
-previous script: each dataset is processed independently using explicit paths and
-parsers for the known annotation formats.  Adjust the `RAW_BASE` and `OUT_BASE`
-constants below if your folder names differ.
+Usage:
+  conda activate automind
+  python prepare_datasets.py \
+    --mtsd  datasets/raw/mtsd \
+    --bdd   datasets/raw/bdd100k \
+    --out   datasets/traffic \
+    [--export_lanes datasets/lanes] \
+    [--dryrun]
 
-For each dataset, images and corresponding label files are copied into
-``datasets/traffic/images/{split}`` and ``datasets/traffic/labels/{split}``, where
-``split`` is one of ``train``, ``val``, or ``test``.  LISA does not provide an
-official split, so all of its images are placed into the ``train`` split by default.
-
-Usage::
-
-    python prepare_datasets_clean.py
-
-Ensure that the following folder structure exists before running the script::
-
-    datasets/
-      raw/
-        bdd100k/
-          images/100k/{train,val,test}            # BDD100K images
-          labels/det_20/{train,val}.json          # optional aggregated detection labels
-          labels/{train,val,test}/*.json          # per‑image detection labels
-        bstld/
-          train/img/                             # images
-          train/ann/                             # annotation files (.png.json)
-          test/img/
-          test/ann/
-        lisa/
-          daySequence*/dayClip*/frames/*.jpg     # images
-          dayTrain/dayClip*/frames/*.jpg
-          nightSequence*/nightClip*/frames/*.jpg
-          nightTrain/nightClip*/frames/*.jpg
-          **/frameAnnotationsBOX.csv             # bounding boxes
-          **/frameAnnotationsBULB.csv            # optional second pass
-        mtsd/
-          mtsd_fully_annotated_annotation/
-            mtsd_v2_fully_annotated/
-              annotations/*.json                # per‑image annotations
-              splits/{train,val,test}.txt        # lists of IDs
-          mtsd_fully_annotated_images.train.*/*   # image folders
-          mtsd_fully_annotated_images.val/
-          mtsd_fully_annotated_images.test/
-
-After running the script, ``datasets/traffic/`` will contain populated
-``images`` and ``labels`` folders ready for training.
-
+Notes:
+- MTSD train/val are preserved as-is; BDD train/val/test preserved as-is.
+- We DO NOT take BDD "traffic sign" labels (to avoid conflicts); signs come only from MTSD.
+- We DO derive traffic-light classes from BDD attributes: red/yellow/green.
 """
 
-import os
-import json
-import csv
-import shutil
+import argparse, json, os, re, shutil, sys, random
 from pathlib import Path
-from typing import Dict, List, Tuple, Optional
+from collections import defaultdict
+from typing import Dict, Tuple, Optional, List
 
-from PIL import Image
+random.seed(0)
 
+# -------------------- Classes --------------------
+# Keep this ORDER in sync with traffic.yaml below
+CLASSES = [
+    # road users (from BDD)
+    "person", "bicycle", "car", "motorcycle", "bus", "truck",
 
-# ----------------------------------------------------------------------------
-# Configuration
-# ----------------------------------------------------------------------------
+    # traffic light states (from BDD attributes)
+    "traffic_light_red", "traffic_light_yellow", "traffic_light_green",
 
-# Location of the raw datasets.  Update this if your raw datasets live
-# elsewhere.  The folder should contain subfolders named ``bdd100k``,
-# ``bstld``, ``lisa``, and ``mtsd`` with the structures shown in the
-# module docstring.
-RAW_BASE = Path('datasets/raw')
-
-# Location where the YOLO‑formatted dataset will be written.  The script
-# creates ``images/{train,val,test}`` and ``labels/{train,val,test}``
-# subdirectories here.
-OUT_BASE = Path('datasets/traffic')
-
-# Ordered list of class names.  These names are used to map category
-# strings in the raw annotations to integer indices (0‑based).  The
-# ordering must match the one used in your YOLO training configuration
-# (traffic.yaml).  Feel free to add or remove classes as needed.
-CLASSES: List[str] = [
-    'speed_sign',      # generic speed limit sign
-    'stop',            # stop sign
-    'yield',           # yield sign
-    'no_entry',        # do‑not‑enter sign
-    'other_sign',      # fallback for miscellaneous signs
-    'traffic_light_red',
-    'traffic_light_yellow',
-    'traffic_light_green',
-    'car',
-    'bus',
-    'truck',
-    'motorcycle',
-    'bicycle',
-    'pedestrian',
+    # traffic signs (from MTSD)
+    "stop", "yield", "no_entry", "speed_limit_sign",
+    "pedestrian_crossing_sign",
+    "no_left_turn", "no_right_turn", "no_u_turn",
+    "one_way", "turn_left", "turn_right", "go_straight",
+    "roundabout", "keep_right", "keep_left", "pass_either_side",
+    "priority_road", "no_parking", "no_stopping", "height_limit",
+    "children_crossing", "road_bump", "curve_left", "curve_right",
+    "roadworks", "parking_info", "bicycles_only",
+    # (optional catch-all)
+    "other_sign"
 ]
+NAME2ID = {n:i for i,n in enumerate(CLASSES)}
 
-# Map LISA annotation tags to class names.  These mappings are case‑sensitive;
-# additional prefixes are handled in code below.
-LISA_MAP: Dict[str, str] = {
-    'stop': 'stop',
-    'yield': 'yield',
-    'doNotEnter': 'no_entry',
-    'do_not_enter': 'no_entry',
-    'warning': 'other_sign',
-    # Generic mapping for speed signs; see logic in convert_lisa
-}
+# -------------------- FS helpers --------------------
+def ensure_dir(p: Path):
+    p.mkdir(parents=True, exist_ok=True)
 
-# Map BSTLD class titles to class names.  Only red/yellow/green are used.
-BSTLD_MAP: Dict[str, Optional[str]] = {
-    'red': 'traffic_light_red',
-    'yellow': 'traffic_light_yellow',
-    'green': 'traffic_light_green',
-    'off': None,  # ignore unlit lights
-}
+def symlink(src: Path, dst: Path):
+    ensure_dir(dst.parent)
+    try:
+        if dst.exists() or dst.is_symlink():
+            dst.unlink()
+        os.symlink(src, dst)
+    except Exception:
+        # Fallback: copy if symlink not permitted
+        shutil.copy2(src, dst)
 
-# Map BDD100K categories to class names.  Unknown categories are ignored.
-BDD100K_MAP: Dict[str, Optional[str]] = {
-    'traffic sign': 'other_sign',
-    'traffic light': None,  # BDD labels lights but not their state
-    'car': 'car',
-    'bus': 'bus',
-    'truck': 'truck',
-    'train': None,
-    'motorcycle': 'motorcycle',
-    'motor': 'motorcycle',
-    'bike': 'bicycle',
-    'bicycle': 'bicycle',
-    'person': 'pedestrian',
-    'pedestrian': 'pedestrian',
-    'rider': 'motorcycle',
-}
+def write_yolo_txt(txt_path: Path, recs: List[Tuple[int,float,float,float,float]]):
+    ensure_dir(txt_path.parent)
+    if not recs:
+        # We still create an empty file so YOLO knows this image has no objects for that source
+        txt_path.write_text("")
+        return
+    lines = []
+    for (cid, cx, cy, w, h) in recs:
+        lines.append(f"{cid} {cx:.6f} {cy:.6f} {w:.6f} {h:.6f}")
+    txt_path.write_text("\n".join(lines))
 
-# Heuristic mapping for MTSD labels.  Some codes like
-# ``regulatory--maximum-speed-limit-50--g2`` are mapped via substring checks.
-def map_mtsd_label(label: str) -> Optional[str]:
-    """Map a raw MTSD label string to one of the defined class names.
+def norm_bbox(x1, y1, x2, y2, W, H):
+    # clip & sanitize
+    x1 = max(0.0, min(float(x1), W-1))
+    y1 = max(0.0, min(float(y1), H-1))
+    x2 = max(0.0, min(float(x2), W-1))
+    y2 = max(0.0, min(float(y2), H-1))
+    if x2 <= x1 or y2 <= y1: return None
+    cx = ((x1 + x2) / 2.0) / W
+    cy = ((y1 + y2) / 2.0) / H
+    w  = (x2 - x1) / W
+    h  = (y2 - y1) / H
+    if w <= 0 or h <= 0: return None
+    return (cx, cy, w, h)
 
-    If the label encodes a speed limit, stop, yield, or do‑not‑enter sign,
-    return the corresponding class name.  Otherwise return 'other_sign'.
+# -------------------- MTSD mapping --------------------
+def map_mtsd_label(label: str) -> Optional[int]:
+    """Map MTSD taxonomy string (e.g., 'regulatory--stop--g1') to our class IDs."""
+    s = (label or "").lower()
+
+    # Priority exact-ish patterns first
+    if "regulatory--stop" in s: return NAME2ID["stop"]
+    if "regulatory--yield" in s: return NAME2ID["yield"]
+    if "regulatory--no-entry" in s: return NAME2ID["no_entry"]
+
+    # Speed limits (collapse all to one class; numeric value read at runtime in-app if needed)
+    if "regulatory--maximum-speed-limit" in s or "regulatory--speed-limit" in s:
+        return NAME2ID["speed_limit_sign"]
+
+    # Pedestrian crossing (both info & warning families)
+    if "pedestrians-crossing" in s: return NAME2ID["pedestrian_crossing_sign"]
+
+    # No turns
+    if "regulatory--no-left-turn" in s:  return NAME2ID["no_left_turn"]
+    if "regulatory--no-right-turn" in s: return NAME2ID["no_right_turn"]
+    if "regulatory--no-u-turn" in s:     return NAME2ID["no_u_turn"]
+
+    # One-way, Go/Turn arrows (collapse to three directional intents)
+    if "regulatory--one-way" in s:       return NAME2ID["one_way"]
+    if "regulatory--turn-left" in s or "complementary--go-left" in s:    return NAME2ID["turn_left"]
+    if "regulatory--turn-right" in s or "complementary--go-right" in s:  return NAME2ID["turn_right"]
+    if "regulatory--go-straight" in s or "one-way-straight" in s:        return NAME2ID["go_straight"]
+
+    # Keep/Pass/Priority
+    if "keep-right" in s:  return NAME2ID["keep_right"]
+    if "keep-left" in s:   return NAME2ID["keep_left"]
+    if "pass-on-either-side" in s: return NAME2ID["pass_either_side"]
+    if "priority-road" in s: return NAME2ID["priority_road"]
+    if "roundabout" in s:    return NAME2ID["roundabout"]
+
+    # Parking / no-parking / no-stopping
+    if "information--parking" in s: return NAME2ID["parking_info"]
+    if "regulatory--no-parking" in s: return NAME2ID["no_parking"]
+    if "regulatory--no-stopping" in s: return NAME2ID["no_stopping"]
+
+    # Warnings and restrictions
+    if "height-limit" in s:       return NAME2ID["height_limit"]
+    if "children" in s:           return NAME2ID["children_crossing"]
+    if "road-bump" in s or "speed-bump" in s or "hump" in s: return NAME2ID["road_bump"]
+    if "curve-left" in s:         return NAME2ID["curve_left"]
+    if "curve-right" in s:        return NAME2ID["curve_right"]
+    if "roadworks" in s or "construction" in s: return NAME2ID["roadworks"]
+    if "bicycles-only" in s or "bike-only" in s: return NAME2ID["bicycles_only"]
+
+    # Fallbacks / tails
+    if "other-sign" in s: return NAME2ID["other_sign"]
+    return None  # ignore all else
+
+# -------------------- BDD100K mapping --------------------
+def map_bdd_category(cat: str, attrs: dict) -> Optional[int]:
+    c = (cat or "").lower()
+    if c in ("person",): return NAME2ID["person"]
+    if c in ("bike","bicycle"): return NAME2ID["bicycle"]
+    if c in ("motor","motorcycle","motorbike"): return NAME2ID["motorcycle"]
+    if c in ("car",): return NAME2ID["car"]
+    if c in ("bus",): return NAME2ID["bus"]
+    if c in ("truck",): return NAME2ID["truck"]
+
+    # Traffic light with color attribute → 3 classes
+    if c in ("traffic light","traffic_light","tl","tlight"):
+        color = (attrs or {}).get("trafficLightColor","").lower()
+        if color == "red":    return NAME2ID["traffic_light_red"]
+        if color == "yellow": return NAME2ID["traffic_light_yellow"]
+        if color == "green":  return NAME2ID["traffic_light_green"]
+        return None  # skip unknown/none/off
+
+    # DO NOT take BDD "traffic sign" (signs come from MTSD)
+    return None
+
+# -------------------- Image indexing --------------------
+def index_images(root: Path) -> Dict[str, Path]:
     """
-    low = label.lower()
-    # Speed limits contain 'speed' or 'maximum-speed-limit'
-    if 'speed' in low or 'maximum-speed-limit' in low:
-        return 'speed_sign'
-    if 'stop' in low:
-        return 'stop'
-    if 'yield' in low:
-        return 'yield'
-    if 'do-not-enter' in low or 'do_not_enter' in low or 'no-entry' in low:
-        return 'no_entry'
-    # Could extend with more mappings here
-    return 'other_sign'
-
-
-# ----------------------------------------------------------------------------
-# Utility functions
-# ----------------------------------------------------------------------------
-
-def ensure_dirs(base: Path) -> None:
-    """Create images/labels subdirectories for train, val and test splits."""
-    for split in ['train', 'val', 'test']:
-        (base / 'images' / split).mkdir(parents=True, exist_ok=True)
-        (base / 'labels' / split).mkdir(parents=True, exist_ok=True)
-
-
-def write_yolo_label(file_path: Path, boxes: List[Tuple[int, float, float, float, float]]) -> None:
-    """Write YOLO bounding boxes to a file.  Boxes are (cls, x_c, y_c, w, h)."""
-    file_path.parent.mkdir(parents=True, exist_ok=True)
-    with file_path.open('w') as f:
-        for cls_idx, x_c, y_c, bw, bh in boxes:
-            f.write(f"{cls_idx} {x_c:.6f} {y_c:.6f} {bw:.6f} {bh:.6f}\n")
-
-
-def copy_image(src: Path, dst: Path) -> None:
-    """Copy an image from src to dst, creating any necessary directories."""
-    dst.parent.mkdir(parents=True, exist_ok=True)
-    shutil.copy2(src, dst)
-
-
-# ----------------------------------------------------------------------------
-# Conversion functions
-# ----------------------------------------------------------------------------
-
-def convert_lisa(raw_dir: Path, out_dir: Path, seed: int = 42) -> None:
-    """Convert the LISA Traffic Sign dataset to YOLO format.
-
-    This version supports an optional random split: all images are first
-    collected with their annotations, then assigned to train/val/test
-    splits using an 80/10/10 ratio.  If you prefer to place all
-    samples in a single split, set the random seed to ``None`` and all
-    files will default to ``train``.
-
-    The function walks through every CSV file matching ``frameAnnotations*.csv``
-    under ``raw_dir``.  Each row in the CSV provides a filename, a sign type,
-    and bounding box coordinates.  If the sign type starts with
-    ``speedLimit`` (case‑insensitive), it is mapped to ``speed_sign``.
-    Otherwise the mapping is looked up in ``LISA_MAP``; unknown tags
-    become ``other_sign``.
+    Build a basename->path map for quick lookups.
+    For MTSD, images live under mtsd_fully_annotated_images/* (train/val shards).
     """
-    # Gather all annotations keyed by relative image path
-    annotations: Dict[str, List[Tuple[str, int, int, int, int]]] = {}
-    csv_files = list(raw_dir.rglob('frameAnnotationsBOX.csv')) + list(raw_dir.rglob('frameAnnotationsBULB.csv'))
-    for csv_path in csv_files:
+    idx = {}
+    for p in root.rglob("*"):
+        if p.is_file() and p.suffix.lower() in (".jpg",".jpeg",".png",".bmp",".webp"):
+            idx[p.name.lower()] = p
+    return idx
+
+# -------------------- MTSD ingest --------------------
+def ingest_mtsd(mtsd_root: Path, out_root: Path, coverage: Dict[str, Dict[int,int]]):
+    ann_dir = mtsd_root/"mtsd_fully_annotated_annotation"/"mtsd_v2_fully_annotated"/"annotations"
+    img_root = mtsd_root/"mtsd_fully_annotated_images"
+    if not ann_dir.exists() or not img_root.exists():
+        print(f"MTSD: expected {ann_dir} and {img_root}, skipping.")
+        return
+
+    idx = index_images(img_root)
+
+    # Determine split from filename prefix: mtsd_fully_annotated_images.train.0*.json vs ...val...
+    def guess_split(ann_path: Path) -> str:
+        n = ann_path.name.lower()
+        if ".train." in n: return "train"
+        if ".val"   in n:  return "val"
+        return "train"  # default
+
+    for j in sorted(ann_dir.glob("*.json")):
         try:
-            with csv_path.open(newline='') as f:
-                reader = csv.reader(f, delimiter=';')
-                # Skip header if present
-                _ = next(reader, None)
-                for row in reader:
-                    if len(row) < 6:
-                        continue
-                    fn = row[0].strip()
-                    tag = row[1].strip()
-                    try:
-                        x1 = int(row[2]); y1 = int(row[3]); x2 = int(row[4]); y2 = int(row[5])
-                    except Exception:
-                        continue
-                    annotations.setdefault(fn, []).append((tag, x1, y1, x2, y2))
+            data = json.loads(j.read_text())
         except Exception as e:
-            print(f"LISA: failed to read {csv_path}: {e}")
-
-    # Determine split for each image
-    rel_paths = list(annotations.keys())
-    # Shuffle with seed if provided
-    if seed is not None:
-        import random
-        random.Random(seed).shuffle(rel_paths)
-    # Compute counts
-    total = len(rel_paths)
-    n_train = int(total * 0.8)
-    n_val = int(total * 0.1)
-    # Remainder goes to test
-    # Map each relative path to a split
-    split_map: Dict[str, str] = {}
-    for i, rel in enumerate(rel_paths):
-        if seed is None:
-            # Everything to train
-            split = 'train'
-        else:
-            if i < n_train:
-                split = 'train'
-            elif i < n_train + n_val:
-                split = 'val'
-            else:
-                split = 'test'
-        split_map[rel] = split
-
-    # Copy images and write labels for each split
-    for rel_path, boxes in annotations.items():
-        img_path = raw_dir / rel_path
-        if not img_path.exists():
-            # Try to locate by basename within raw_dir
-            found = list(raw_dir.rglob(os.path.basename(rel_path)))
-            if found:
-                img_path = found[0]
-            else:
-                print(f"LISA: image not found for {rel_path}")
-                continue
-        # Determine split
-        split = split_map.get(rel_path, 'train')
-        # Output directories
-        images_out = out_dir / 'images' / split
-        labels_out = out_dir / 'labels' / split
-        # Copy image
-        out_img = images_out / img_path.name
-        copy_image(img_path, out_img)
-        # Image dimensions
-        try:
-            w, h = Image.open(img_path).size
-        except Exception:
-            w, h = 1, 1
-        yolo_boxes: List[Tuple[int, float, float, float, float]] = []
-        for tag, x1, y1, x2, y2 in boxes:
-            # Determine class
-            tag_low = tag.lower()
-            if tag_low.startswith('speedlimit'):
-                cls_name = 'speed_sign'
-            elif tag_low.startswith('donotenter') or tag_low.startswith('do_not_enter'):
-                cls_name = 'no_entry'
-            elif tag_low.startswith('yield'):
-                cls_name = 'yield'
-            elif tag_low.startswith('stop'):
-                cls_name = 'stop'
-            else:
-                cls_name = LISA_MAP.get(tag, 'other_sign')
-            if cls_name is None or cls_name not in CLASSES:
-                continue
-            cls_idx = CLASSES.index(cls_name)
-            # Normalise
-            x_c = ((x1 + x2) / 2) / w
-            y_c = ((y1 + y2) / 2) / h
-            bw = (x2 - x1) / w
-            bh = (y2 - y1) / h
-            yolo_boxes.append((cls_idx, x_c, y_c, bw, bh))
-        # Write label file
-        lbl_path = labels_out / (img_path.stem + '.txt')
-        write_yolo_label(lbl_path, yolo_boxes)
-
-
-def convert_bstld(raw_dir: Path, out_dir: Path) -> None:
-    """Convert the BSTLD dataset to YOLO format.
-
-    Processes the ``train`` and ``test`` splits in the directory structure
-    ``bstld/train/img``, ``bstld/train/ann`` and similarly for ``test``.  The
-    images are copied into ``train`` and ``test`` splits respectively; BSTLD
-    does not contain a validation split.  Each annotation JSON (``*.png.json``
-    or ``*.jpg.json``) contains a list of ``objects`` with a ``classTitle``
-    (e.g. ``red``, ``green``, ``yellow``) and bounding box coordinates under
-    ``points`` → ``exterior``.
-    """
-    for split in ['train', 'test']:
-        split_dir = raw_dir / split
-        if not split_dir.exists():
+            print("MTSD: bad JSON:", j, e)
             continue
-        img_dir = split_dir / 'img'
-        ann_dir = split_dir / 'ann'
-        out_img_base = out_dir / 'images' / split
-        out_lbl_base = out_dir / 'labels' / split
-        for img_path in img_dir.glob('*.*'):
-            if img_path.suffix.lower() not in ['.png', '.jpg', '.jpeg']:
+
+        # Heuristics to find the image filename
+        # Try common keys
+        cand_names = []
+        for k in ("img","image","img_name","name","id","filename","file","path"):
+            v = data.get(k)
+            if isinstance(v, str) and (v.lower().endswith((".jpg",".jpeg",".png")) or len(v)>0):
+                cand_names.append(Path(v).name)
+        if not cand_names:
+            # Use objects' image field if present
+            pass
+        # Fallback to JSON stem
+        cand_names.append(j.stem + ".jpg")
+        cand_names.append(j.stem + ".png")
+
+        img_path = None
+        for nm in cand_names:
+            p = idx.get(nm.lower())
+            if p:
+                img_path = p; break
+        if not img_path:
+            # last resort: linear search by stem
+            stem = j.stem.lower()
+            for k,v in idx.items():
+                if Path(k).stem.lower() == stem: img_path = v; break
+        if not img_path:
+            continue
+
+        # image size
+        try:
+            from PIL import Image
+            with Image.open(img_path) as im:
+                W,H = im.width, im.height
+        except:
+            continue
+
+        recs = []
+        for o in data.get("objects", []):
+            label = o.get("label","")
+            cid = map_mtsd_label(label)
+            if cid is None:
                 continue
-            # Find corresponding annotation file; try <name>.<ext>.json then <name>.json
-            ann_path = ann_dir / (img_path.name + '.json')
-            if not ann_path.exists():
-                ann_path = ann_dir / (img_path.stem + '.json')
-            # Copy image
-            out_img = out_img_base / img_path.name
-            copy_image(img_path, out_img)
-            # Read annotation
-            yolo_boxes: List[Tuple[int, float, float, float, float]] = []
-            if ann_path.exists():
-                try:
-                    data = json.load(ann_path.open())
-                except Exception as e:
-                    print(f"BSTLD: failed to read {ann_path}: {e}")
-                    data = {}
-                objects = data.get('objects', [])
-                # Image dimensions
-                try:
-                    w, h = Image.open(img_path).size
-                except Exception:
-                    w, h = 1, 1
-                for obj in objects:
-                    state = obj.get('classTitle')  # 'red', 'yellow', 'green', 'off'
-                    cls_name = BSTLD_MAP.get(state)
-                    if cls_name is None or cls_name not in CLASSES:
+
+            # bbox may be present as list/dict; else polygon -> bbox
+            x1=y1=x2=y2=None
+            if "bbox" in o:
+                bb = o["bbox"]
+                # formats: [x,y,w,h] or {"x":..,"y":..,"w":..,"h":..}
+                if isinstance(bb, (list,tuple)) and len(bb)>=4:
+                    x, y, w, h = float(bb[0]), float(bb[1]), float(bb[2]), float(bb[3])
+                    x1,y1,x2,y2 = x, y, x+w, y+h
+                elif isinstance(bb, dict):
+                    x, y, w, h = float(bb.get("x",0)), float(bb.get("y",0)), float(bb.get("w",0)), float(bb.get("h",0))
+                    x1,y1,x2,y2 = x, y, x+w, y+h
+            if x1 is None:
+                poly = o.get("polygon") or o.get("poly") or []
+                if isinstance(poly, list) and len(poly)>=3:
+                    xs = [float(p[0]) for p in poly]
+                    ys = [float(p[1]) for p in poly]
+                    x1, y1, x2, y2 = min(xs), min(ys), max(xs), max(ys)
+            if x1 is None:
+                continue
+
+            bb = norm_bbox(x1,y1,x2,y2, W,H)
+            if bb:
+                recs.append((cid,*bb))
+                coverage["mtsd"][cid] += 1
+
+        split = guess_split(j)
+        out_img = out_root/"images"/split/img_path.name
+        out_txt = out_root/"labels"/split/(img_path.stem + ".txt")
+        symlink(img_path, out_img)
+        write_yolo_txt(out_txt, recs)
+
+# -------------------- BDD100K ingest --------------------
+def _bdd_find_image(bdd_root: Path, split: str, name: str) -> Optional[Path]:
+    # images/<split>/<name>.jpg|.png
+    for ext in (".jpg",".jpeg",".png"):
+        p = bdd_root/"images"/split/(name + ext)
+        if p.exists(): return p
+    # tracking-style: images/track/<split>/<name>/000000.ext
+    track_dir = bdd_root/"images"/"track"/split/name
+    if track_dir.exists():
+        for k in range(0, 6):
+            for ext in (".jpg",".jpeg",".png"):
+                q = track_dir/(f"{k:06d}"+ext)
+                if q.exists(): return q
+    return None
+
+def ingest_bdd100k(bdd_root: Path, out_root: Path, coverage: Dict[str, Dict[int,int]]):
+    for split in ("train","val","test"):
+        labels_dir = bdd_root/"labels"/split
+        if not labels_dir.exists():
+            continue
+
+        for j in labels_dir.glob("*.json"):
+            try:
+                data = json.loads(j.read_text())
+            except Exception as e:
+                print("BDD100K: bad JSON:", j, e)
+                continue
+
+            name = data.get("name") or j.stem
+            img_path = _bdd_find_image(bdd_root, split, name)
+            if not img_path:
+                continue
+
+            try:
+                from PIL import Image
+                with Image.open(img_path) as im:
+                    W,H = im.width, im.height
+            except:
+                continue
+
+            recs = []
+
+            if "labels" in data:
+                # detection-style
+                for o in data["labels"]:
+                    cat = o.get("category","")
+                    attrs = o.get("attributes", {})
+                    cid = map_bdd_category(cat, attrs)
+                    if cid is None:
                         continue
-                    cls_idx = CLASSES.index(cls_name)
-                    points = obj.get('points', {}).get('exterior', [])
-                    if len(points) != 2:
+                    box = o.get("box2d")
+                    if not box:
                         continue
-                    x1, y1 = points[0]
-                    x2, y2 = points[1]
-                    x_c = ((x1 + x2) / 2) / w
-                    y_c = ((y1 + y2) / 2) / h
-                    bw = (x2 - x1) / w
-                    bh = (y2 - y1) / h
-                    yolo_boxes.append((cls_idx, x_c, y_c, bw, bh))
-            # Write label file
-            lbl_path = out_lbl_base / (img_path.stem + '.txt')
-            write_yolo_label(lbl_path, yolo_boxes)
+                    x1,y1,x2,y2 = float(box["x1"]), float(box["y1"]), float(box["x2"]), float(box["y2"])
+                    bb = norm_bbox(x1,y1,x2,y2, W,H)
+                    if bb:
+                        recs.append((cid,*bb))
+                        coverage["bdd"][cid] += 1
 
-
-def convert_bdd100k(raw_dir: Path, out_dir: Path) -> None:
-    """Convert BDD100K detection labels to YOLO format.
-
-    This function reads images from ``images/100k/{train,val,test}`` (or
-    ``images/{split}`` as a fallback) and per‑image detection labels from
-    ``labels/{split}/*.json``.  Images and labels are written into the
-    matching splits (``train``, ``val`` and ``test``).  If no label file
-    exists for a particular image, an empty label file is created so
-    that the image can still be used for inference or evaluation.
-    """
-    for split in ['train', 'val', 'test']:
-        # Determine image and label directories
-        # img_dir = raw_dir / 'images' / '100k' / split
-        # if not img_dir.exists():
-        img_dir = raw_dir / 'images' / split
-        label_dir = raw_dir / 'labels' / split
-        # if not img_dir.exists():
-        #     print(f"BDD100K: image directory not found for split {split}; skipping.")
-        #     continue
-        # if not label_dir.exists():
-        #     # Even if labels are missing, copy images and create empty labels
-        #     print(f"BDD100K: label directory not found for split {split}; images will have empty labels.")
-        out_img_base = out_dir / 'images' / split
-        out_lbl_base = out_dir / 'labels' / split
-        for img_path in img_dir.glob('*.jpg'):
-            # Copy image
-            out_img = out_img_base / img_path.name
-            copy_image(img_path, out_img)
-            # Prepare boxes
-            yolo_boxes: List[Tuple[int, float, float, float, float]] = []
-            # If label directory exists, try to load annotation
-            if label_dir.exists():
-                json_path = label_dir / f"{img_path.stem}.json"
-                if json_path.exists():
-                    try:
-                        data = json.load(json_path.open())
-                    except Exception as e:
-                        print(f"BDD100K: failed to read {json_path}: {e}")
-                        data = {}
-                    # Determine object list: may live under 'labels' or within 'frames'
-                    objects = data.get('labels', [])
-                    if not objects and 'frames' in data:
-                        objects = []
-                        for frame in data.get('frames', []):
-                            objects.extend(frame.get('objects', []))
-                    # Load image size
-                    try:
-                        w, h = Image.open(img_path).size
-                    except Exception:
-                        w, h = 1, 1
-                    for obj in objects:
-                        cat = obj.get('category') or obj.get('label')
-                        cls_name = BDD100K_MAP.get(cat)
-                        if cls_name is None or cls_name not in CLASSES:
+            elif "frames" in data:
+                # tracking-style: pick first frame that has usable objects
+                for fr in data["frames"]:
+                    tmp=[]
+                    for o in fr.get("objects", []):
+                        cat = o.get("category","")
+                        attrs = o.get("attributes", {})
+                        cid = map_bdd_category(cat, attrs)
+                        if cid is None:
                             continue
-                        cls_idx = CLASSES.index(cls_name)
-                        box = obj.get('box2d') or obj.get('bbox')
+                        box = o.get("box2d")
                         if not box:
                             continue
-                        x1 = box.get('x1') or box.get('xmin') or box.get('left')
-                        y1 = box.get('y1') or box.get('ymin') or box.get('top')
-                        x2 = box.get('x2') or box.get('xmax') or box.get('right')
-                        y2 = box.get('y2') or box.get('ymax') or box.get('bottom')
-                        if None in (x1, y1, x2, y2):
-                            continue
-                        x_c = ((x1 + x2) / 2) / w
-                        y_c = ((y1 + y2) / 2) / h
-                        bw = (x2 - x1) / w
-                        bh = (y2 - y1) / h
-                        yolo_boxes.append((cls_idx, x_c, y_c, bw, bh))
-            # Write label file (even if empty)
-            lbl_path = out_lbl_base / (img_path.stem + '.txt')
-            write_yolo_label(lbl_path, yolo_boxes)
-
-
-def convert_mtsd(raw_dir: Path, out_dir: Path) -> None:
-    """Convert the Mapillary Traffic Sign Dataset (fully annotated) to YOLO format.
-
-    The directory ``raw_dir`` should contain a folder ``mtsd_fully_annotated_annotation``
-    with subfolders ``mtsd_v2_fully_annotated/annotations`` (per‑image JSON) and
-    ``mtsd_v2_fully_annotated/splits`` (txt files listing IDs for train, val and test).
-    It should also contain image folders whose names start with
-    ``mtsd_fully_annotated_images``.  This function reads the annotation JSONs,
-    maps labels to the defined classes via heuristics, and writes images and
-    YOLO labels into the appropriate split.
-    """
-    # Find annotation folder
-    ann_dir = None
-    for candidate in raw_dir.rglob('annotations'):
-        if candidate.is_dir():
-            ann_dir = candidate
-            break
-    if ann_dir is None:
-        print("MTSD: annotations folder not found; skipping.")
-        return
-    # Load split lists if present
-    split_ids: Dict[str, set] = {'train': set(), 'val': set(), 'test': set()}
-    splits_dir = ann_dir.parent / 'splits'
-    if splits_dir.exists():
-        for split in ['train', 'val', 'test']:
-            split_file = splits_dir / f'{split}.txt'
-            if split_file.exists():
-                with split_file.open() as f:
-                    split_ids[split] = {ln.strip() for ln in f if ln.strip()}
-    # Preindex images by ID (stem)
-    image_lookup: Dict[str, Path] = {}
-    for img_root in raw_dir.glob('mtsd_fully_annotated_images*'):
-        for img_path in img_root.rglob('*.*'):
-            if img_path.suffix.lower() not in ['.jpg', '.jpeg', '.png']:
-                continue
-            image_lookup[img_path.stem] = img_path
-    # Process each annotation file
-    for ann_path in ann_dir.glob('*.json'):
-        img_id = ann_path.stem
-        # Determine split
-        target_split = 'train'
-        for split in ['train', 'val', 'test']:
-            if split_ids[split] and img_id in split_ids[split]:
-                target_split = split
-                break
-        # Load annotation
-        try:
-            data = json.load(ann_path.open())
-        except Exception as e:
-            print(f"MTSD: failed to read {ann_path}: {e}")
-            continue
-        # Find image path
-        img_path = image_lookup.get(img_id)
-        if img_path is None or not img_path.exists():
-            # fallback: some JSONs include 'image' field
-            ref = data.get('image') or data.get('filename') or data.get('file')
-            if ref:
-                possible = raw_dir / ref
-                if possible.exists():
-                    img_path = possible
-                else:
-                    # search by basename
-                    name_only = os.path.basename(ref)
-                    for p in raw_dir.rglob(name_only):
-                        img_path = p
+                        x1,y1,x2,y2 = float(box["x1"]), float(box["y1"]), float(box["x2"]), float(box["y2"])
+                        bb = norm_bbox(x1,y1,x2,y2, W,H)
+                        if bb:
+                            tmp.append((cid,*bb))
+                    if tmp:
+                        recs = tmp
                         break
-        if img_path is None or not img_path.exists():
-            print(f"MTSD: image file for {img_id} not found; skipping.")
-            continue
-        # Copy image
-        out_img = out_dir / 'images' / target_split / img_path.name
-        copy_image(img_path, out_img)
-        # Prepare boxes
-        try:
-            w, h = Image.open(img_path).size
-        except Exception:
-            w, h = 1, 1
-        yolo_boxes: List[Tuple[int, float, float, float, float]] = []
-        objects = data.get('objects') or data.get('labels') or []
-        for obj in objects:
-            label = obj.get('label') or obj.get('class') or obj.get('sign') or obj.get('category')
-            if not label:
-                continue
-            cls_name = map_mtsd_label(label)
-            if cls_name is None or cls_name not in CLASSES:
-                continue
-            cls_idx = CLASSES.index(cls_name)
-            bbox = obj.get('bbox') or obj.get('box') or obj.get('bounds') or obj.get('rectangle')
-            if not bbox:
-                continue
-            # Handle dict or list bboxes
-            if isinstance(bbox, dict):
-                x1 = bbox.get('x1') or bbox.get('xmin') or bbox.get('left')
-                y1 = bbox.get('y1') or bbox.get('ymin') or bbox.get('top')
-                x2 = bbox.get('x2') or bbox.get('xmax') or bbox.get('right')
-                y2 = bbox.get('y2') or bbox.get('ymax') or bbox.get('bottom')
-            elif isinstance(bbox, list) and len(bbox) >= 4:
-                x1, y1, x2, y2 = bbox[:4]
+
+            out_img = out_root/"images"/split/img_path.name
+            out_txt = out_root/"labels"/split/(img_path.stem + ".txt")
+            symlink(img_path, out_img)
+            write_yolo_txt(out_txt, recs)
+
+# -------------------- Optional Lane Export (simple mask) --------------------
+def export_bdd_lanes(bdd_root: Path, lanes_out: Path):
+    """
+    Creates a binary lane mask for each BDD image that has lane polygons.
+    This is a simple starter for training a future lane segmentation model.
+    """
+    from PIL import Image, ImageDraw
+    ensure_dir(lanes_out/"images/train"); ensure_dir(lanes_out/"masks/train")
+    ensure_dir(lanes_out/"images/val");   ensure_dir(lanes_out/"masks/val")
+    ensure_dir(lanes_out/"images/test");  ensure_dir(lanes_out/"masks/test")
+
+    def draw_mask(polys, W,H):
+        mask = Image.new("L", (W,H), 0)
+        dr = ImageDraw.Draw(mask)
+        for poly in polys:
+            if len(poly) >= 3:
+                dr.polygon(poly, outline=255, fill=255)
+        return mask
+
+    for split in ("train","val","test"):
+        labels_dir = bdd_root/"labels"/split
+        if not labels_dir.exists(): continue
+        for j in labels_dir.glob("*.json"):
+            data = json.loads(j.read_text())
+            name = data.get("name") or j.stem
+            img_path = _bdd_find_image(bdd_root, split, name)
+            if not img_path: continue
+
+            # gather lane polygons
+            polys=[]
+            if "labels" in data:
+                objs = data["labels"]
+            elif "frames" in data and data["frames"]:
+                objs = data["frames"][0].get("objects", [])
             else:
+                objs = []
+            for o in objs:
+                cat = (o.get("category","") or "").lower()
+                if not cat.startswith("lane/"):
+                    continue
+                for poly in o.get("poly2d", []):
+                    # poly2d is a list of [x,y,"L"|"C"], we take the (x,y)
+                    pts = [(float(px), float(py)) for (px,py,*_) in poly]
+                    polys.append(pts)
+
+            if not polys:
                 continue
-            if None in (x1, y1, x2, y2):
-                continue
-            x_c = ((x1 + x2) / 2) / w
-            y_c = ((y1 + y2) / 2) / h
-            bw = (x2 - x1) / w
-            bh = (y2 - y1) / h
-            yolo_boxes.append((cls_idx, x_c, y_c, bw, bh))
-        # Write label file
-        lbl_path = out_dir / 'labels' / target_split / (img_path.stem + '.txt')
-        write_yolo_label(lbl_path, yolo_boxes)
 
+            from PIL import Image
+            with Image.open(img_path) as im:
+                W,H = im.width, im.height
+            mask = draw_mask(polys, W,H)
 
-# ----------------------------------------------------------------------------
-# Entry point
-# ----------------------------------------------------------------------------
+            out_img = lanes_out/f"images/{split}"/img_path.name
+            out_msk = lanes_out/f"masks/{split}"/(img_path.stem + ".png")
+            symlink(img_path, out_img)
+            mask.save(out_msk)
 
-def main() -> None:
-    ensure_dirs(OUT_BASE)
-    # Convert each dataset
-    lisa_dir = RAW_BASE / 'lisa'
-    if lisa_dir.exists():
-        print('Converting LISA...')
-        convert_lisa(lisa_dir, OUT_BASE)
-    else:
-        print('LISA dataset not found; skipping.')
-    bstld_dir = RAW_BASE / 'bstld'
-    if bstld_dir.exists():
-        print('Converting BSTLD...')
-        convert_bstld(bstld_dir, OUT_BASE)
-    else:
-        print('BSTLD dataset not found; skipping.')
-    bdd_dir = RAW_BASE / 'bdd100k'
-    if bdd_dir.exists():
-        print('Converting BDD100K...')
-        convert_bdd100k(bdd_dir, OUT_BASE)
-    else:
-        print('BDD100K dataset not found; skipping.')
-    mtsd_dir = RAW_BASE / 'mtsd'
-    if mtsd_dir.exists():
-        print('Converting MTSD...')
-        convert_mtsd(mtsd_dir, OUT_BASE)
-    else:
-        print('MTSD dataset not found; skipping.')
-    print('Conversion finished.')
+# -------------------- CLI --------------------
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--mtsd", type=str, required=True, help="Path to MTSD root")
+    ap.add_argument("--bdd",  type=str, required=True, help="Path to BDD100K root")
+    ap.add_argument("--out",  type=str, default="datasets/traffic", help="Output root for YOLO detection")
+    ap.add_argument("--export_lanes", type=str, default=None, help="Optional output root for BDD lane masks")
+    ap.add_argument("--dryrun", action="store_true")
+    args = ap.parse_args()
 
+    mtsd_root = Path(args.mtsd)
+    bdd_root  = Path(args.bdd)
+    out_root  = Path(args.out)
 
-if __name__ == '__main__':
+    # Prepare folder tree
+    for split in ("train","val","test"):
+        ensure_dir(out_root/"images"/split)
+        ensure_dir(out_root/"labels"/split)
+
+    coverage = defaultdict(lambda: defaultdict(int))
+
+    print("Converting MTSD (signs)...")
+    ingest_mtsd(mtsd_root, out_root, coverage)
+
+    print("Converting BDD100K (road users + traffic lights)...")
+    ingest_bdd100k(bdd_root, out_root, coverage)
+
+    if args.export_lanes:
+        print("Exporting BDD100K lane masks...")
+        export_bdd_lanes(bdd_root, Path(args.export_lanes))
+
+    # Show coverage summary
+    print("\nCoverage (instances per class):")
+    inv = {v:k for k,v in NAME2ID.items()}
+    totals = defaultdict(int)
+    for src, d in coverage.items():
+        for cid, n in d.items():
+            totals[cid] += n
+    for cid in range(len(CLASSES)):
+        print(f"{cid:2d} {inv[cid]:24s} : {totals.get(cid,0)}")
+
+if __name__ == "__main__":
     main()
