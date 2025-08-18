@@ -348,33 +348,87 @@ def ingest_bdd100k(bdd_root: Path, out_root: Path, coverage: Dict[str, Dict[int,
 # -------------------- Optional Lane Export (copy) --------------------
 def export_bdd_lanes(bdd_root: Path, lanes_out: Path):
     """
-    Creates a binary lane mask for each BDD image that has lane polygons.
-    Saves images and masks (copies images).
+    Creates a binary lane mask for each BDD image that has lane polylines/polygons.
+    Handles both dict-style poly2d (with 'vertices') and list-of-[x,y,?] style.
+    Saves images (copied) and masks (PNG).
     """
     from PIL import Image, ImageDraw
+
+    # Prepare folders
     for split in ("train","val","test"):
         ensure_dir(lanes_out/"images"/split)
         ensure_dir(lanes_out/"masks"/split)
 
-    def draw_mask(polys, W,H):
-        mask = Image.new("L", (W,H), 0)
+    def poly2d_to_polys(poly2d):
+        """Return a list of polygons/polylines, each as [(x,y), ...]."""
+        polys = []
+        if not isinstance(poly2d, list):
+            return polys
+
+        # Case A: dict-style items with 'vertices'
+        if poly2d and isinstance(poly2d[0], dict) and "vertices" in poly2d[0]:
+            for item in poly2d:
+                verts = item.get("vertices", [])
+                pts = []
+                for v in verts:
+                    if isinstance(v, (list, tuple)) and len(v) >= 2:
+                        x, y = v[0], v[1]
+                        if isinstance(x, (int, float)) and isinstance(y, (int, float)):
+                            pts.append((float(x), float(y)))
+                if pts:
+                    polys.append(pts)
+            return polys
+
+        # Case B: list-of-[x,y,?] points (possibly with a 3rd "L"/"C")
+        pts = []
+        for pt in poly2d:
+            if isinstance(pt, (list, tuple)) and len(pt) >= 2:
+                x, y = pt[0], pt[1]
+                if isinstance(x, (int, float)) and isinstance(y, (int, float)):
+                    pts.append((float(x), float(y)))
+        if pts:
+            polys.append(pts)
+
+        return polys
+
+    def draw_mask(polylists, W, H):
+        """
+        Draw polygons if closed; draw thick polylines otherwise.
+        """
+        mask = Image.new("L", (W, H), 0)
         dr = ImageDraw.Draw(mask)
-        for poly in polys:
-            if len(poly) >= 3:
-                dr.polygon(poly, outline=255, fill=255)
+        line_w = max(1, int(0.004 * min(W, H)))  # ~0.4% of min dim
+
+        for pts in polylists:
+            if len(pts) >= 3:
+                # Consider it a polygon if near-closed or explicitly closed
+                closed = (abs(pts[0][0] - pts[-1][0]) + abs(pts[0][1] - pts[-1][1])) < 1.0
+                if closed:
+                    dr.polygon(pts, outline=255, fill=255)
+                else:
+                    dr.line(pts, fill=255, width=line_w)
+            elif len(pts) >= 2:
+                dr.line(pts, fill=255, width=line_w)
         return mask
 
     for split in ("train","val","test"):
         labels_dir = bdd_root/"labels"/split
-        if not labels_dir.exists(): continue
+        if not labels_dir.exists():
+            continue
+
         count = 0
         for j in labels_dir.glob("*.json"):
-            data = json.loads(j.read_text())
+            try:
+                data = json.loads(j.read_text())
+            except Exception:
+                continue
+
             name = data.get("name") or j.stem
             img_path = _bdd_find_image(bdd_root, split, name)
-            if not img_path: continue
+            if not img_path:
+                continue
 
-            # gather lane polygons
+            # Gather lane polylines/polygons from labels/tracking frame 0
             if "labels" in data:
                 objs = data["labels"]
             elif "frames" in data and data["frames"]:
@@ -382,21 +436,25 @@ def export_bdd_lanes(bdd_root: Path, lanes_out: Path):
             else:
                 objs = []
 
-            polys=[]
+            all_polys = []
             for o in objs:
-                cat = (o.get("category","") or "").lower()
+                cat = (o.get("category", "") or "").lower()
                 if not cat.startswith("lane/"):
                     continue
-                for poly in o.get("poly2d", []):
-                    pts = [(float(px), float(py)) for (px,py,*_) in poly]
-                    polys.append(pts)
-            if not polys:
+                poly2d = o.get("poly2d", [])
+                polys = poly2d_to_polys(poly2d)
+                all_polys.extend(polys)
+
+            if not all_polys:
                 continue
 
-            from PIL import Image
-            with Image.open(img_path) as im:
-                W,H = im.width, im.height
-            mask = draw_mask(polys, W,H)
+            try:
+                with Image.open(img_path) as im:
+                    W, H = im.width, im.height
+            except Exception:
+                continue
+
+            mask = draw_mask(all_polys, W, H)
 
             out_img = lanes_out/f"images/{split}"/img_path.name
             out_msk = lanes_out/f"masks/{split}"/(img_path.stem + ".png")
