@@ -1,495 +1,446 @@
 #!/usr/bin/env python3
-# coding: utf-8
-import os, sys, json, shutil, glob, random
+# -*- coding: utf-8 -*-
+
+import argparse, json, shutil
 from pathlib import Path
-from collections import defaultdict
+from glob import glob
+from collections import Counter, defaultdict
 from PIL import Image, ImageDraw
 
-RANDOM_SEED = 42
-random.seed(RANDOM_SEED)
+# ---------------------------------------------------------------------
+# Paths
+# ---------------------------------------------------------------------
+PROJECT_ROOT = Path(".").resolve()
+RAW = PROJECT_ROOT / "datasets" / "raw"
+OUT = PROJECT_ROOT / "datasets" / "traffic"
 
-# -------- paths (match your screenshots) ----------
-ROOT = Path(__file__).resolve().parent
-RAW  = ROOT / "datasets" / "raw"
-OUT  = ROOT / "datasets" / "traffic"   # detector export
-LANE_OUT = ROOT / "datasets" / "lanes" # lane masks export
+def ensure_det_dirs():
+    for split in ("train", "val", "test"):
+        (OUT / "images" / split).mkdir(parents=True, exist_ok=True)
+        (OUT / "labels" / split).mkdir(parents=True, exist_ok=True)
 
-# your raw structure (from screenshots)
-BDD_ROOT  = RAW / "bdd100k"
-MTSD_ROOT = RAW / "mtsd"
-# LISA/BSTLD intentionally unused for detector now
-# LISA_ROOT = RAW / "lisa"
-# BSTLD_ROOT = RAW / "bstld"
+def copy_image(src: Path, dst: Path):
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    if not dst.exists():
+        shutil.copy2(src, dst)
 
-# -------- unified detector classes (order for YOLO txt indices) ----------
-NAMES = [
+def open_image_size(path: Path):
+    with Image.open(path) as im:
+        return im.size  # (W, H)
+
+def yolo_line(cls_id, x1, y1, x2, y2, W, H) -> str:
+    cx = ((x1 + x2) / 2.0) / W
+    cy = ((y1 + y2) / 2.0) / H
+    bw = (x2 - x1) / W
+    bh = (y2 - y1) / H
+    cx = min(max(cx, 0.0), 1.0); cy = min(max(cy, 0.0), 1.0)
+    bw = min(max(bw, 0.0), 1.0); bh = min(max(bh, 0.0), 1.0)
+    return f"{cls_id} {cx:.6f} {cy:.6f} {bw:.6f} {bh:.6f}\n"
+
+# ---------------------------------------------------------------------
+# Unified class list (must match your traffic.yaml names order)
+# ---------------------------------------------------------------------
+CLASSES = [
     "person","bicycle","car","motorcycle","bus","truck",
     "traffic_light_red","traffic_light_yellow","traffic_light_green",
-    # Signs (MTSD provides rich classes)
+    # signs:
     "stop","yield","no_entry","speed_limit_sign","pedestrian_crossing_sign",
     "no_left_turn","no_right_turn","no_u_turn","one_way","turn_left","turn_right",
     "go_straight","roundabout","keep_right","keep_left","pass_either_side",
     "priority_road","no_parking","no_stopping","height_limit","children_crossing",
-    "road_bump","curve_left","curve_right","roadworks","parking_info",
-    "bicycles_only","other_sign"
+    "road_bump","curve_left","curve_right","roadworks","parking_info","bicycles_only",
+    "other_sign",
 ]
-NAME2ID = {n:i for i,n in enumerate(NAMES)}
+CLASS_TO_ID = {c: i for i, c in enumerate(CLASSES)}
 
-# ---- MTSD label-string -> our class id (compact mapping) -------------
-def mtsd_label_to_id(label: str):
-    l = label.lower()
-    if l.startswith("regulatory--stop"):                    return NAME2ID["stop"]
-    if l.startswith("regulatory--yield"):                   return NAME2ID["yield"]
-    if l.startswith("regulatory--no-entry"):                return NAME2ID["no_entry"]
-    if "maximum-speed-limit" in l:                           return NAME2ID["speed_limit_sign"]
-    if l.startswith("warning--pedestrians-crossing") or l.startswith("information--pedestrians-crossing"):
-        return NAME2ID["pedestrian_crossing_sign"]
-    if l.startswith("regulatory--no-left-turn"):            return NAME2ID["no_left_turn"]
-    if l.startswith("regulatory--no-right-turn"):           return NAME2ID["no_right_turn"]
-    if l.startswith("regulatory--no-u-turn"):               return NAME2ID["no_u_turn"]
-    if "one-way-left" in l or "one-way-right" in l or "one-way-straight" in l:
-        return NAME2ID["one_way"]
-    if l.startswith("regulatory--turn-left"):               return NAME2ID["turn_left"]
-    if l.startswith("regulatory--turn-right"):              return NAME2ID["turn_right"]
-    if l.startswith("regulatory--go-straight"):             return NAME2ID["go_straight"]
-    if l.startswith("regulatory--roundabout"):              return NAME2ID["roundabout"]
-    if l.startswith("regulatory--keep-right") or l.startswith("complementary--go-right"):
-        return NAME2ID["keep_right"]
-    if l.startswith("regulatory--keep-left") or l.startswith("complementary--go-left"):
-        return NAME2ID["keep_left"]
-    if l.startswith("regulatory--pass-on-either-side"):     return NAME2ID["pass_either_side"]
-    if l.startswith("regulatory--priority-road"):           return NAME2ID["priority_road"]
-    if l.startswith("regulatory--no-parking"):              return NAME2ID["no_parking"]
-    if l.startswith("regulatory--no-stopping"):             return NAME2ID["no_stopping"]
-    if l.startswith("regulatory--height-limit"):            return NAME2ID["height_limit"]
-    if l.startswith("warning--children"):                   return NAME2ID["children_crossing"]
-    if l.startswith("warning--road-bump"):                  return NAME2ID["road_bump"]
-    if l.startswith("warning--curve-left"):                 return NAME2ID["curve_left"]
-    if l.startswith("warning--curve-right"):                return NAME2ID["curve_right"]
-    if l.startswith("warning--roadworks"):                  return NAME2ID["roadworks"]
-    if l.startswith("information--parking"):                return NAME2ID["parking_info"]
-    if l.startswith("regulatory--bicycles-only"):           return NAME2ID["bicycles_only"]
-    # fallback
-    if "sign" in l:                                         return NAME2ID["other_sign"]
-    return None
+# ---------------------------------------------------------------------
+# MTSD (signs) conversion
+# ---------------------------------------------------------------------
+# Try to resolve the annotations directory robustly
+def _resolve_mtsd_ann_dir():
+    explicit = RAW / "mtsd" / "mtsd_fully_annotated_annotation" / "mtsd_v2_fully_annotated" / "annotations"
+    if explicit.exists():
+        return explicit
+    candidates = list(RAW.glob("mtsd/**/mtsd_v2_fully_annotated/annotations"))
+    return candidates[0] if candidates else None
 
-# ---- helpers ----------------------------------------------------------
-def ensure_clean_dir(p: Path):
-    if p.exists():
-        shutil.rmtree(p)
-    p.mkdir(parents=True, exist_ok=True)
+MTSD_ANN_DIR = _resolve_mtsd_ann_dir()
+MTSD_IMG_ROOTS = sorted(map(Path, glob(str(RAW / "mtsd" / "mtsd_fully_annotated_images*"))))
+MTSD_EXTS = (".jpg", ".jpeg", ".png", ".JPG", ".JPEG", ".PNG")
 
-def yolo_line(cls_id, cx, cy, w, h):
-    return f"{cls_id} {cx:.6f} {cy:.6f} {w:.6f} {h:.6f}\n"
-
-def norm_bbox(x1,y1,x2,y2, W,H):
-    # clip and normalize
-    x1 = max(0.0, min(float(x1), W-1))
-    y1 = max(0.0, min(float(y1), H-1))
-    x2 = max(0.0, min(float(x2), W-1))
-    y2 = max(0.0, min(float(y2), H-1))
-    bw = max(1.0, x2 - x1)
-    bh = max(1.0, y2 - y1)
-    cx = (x1 + x2) / 2.0 / W
-    cy = (y1 + y2) / 2.0 / H
-    w  = bw / W
-    h  = bh / H
-    return cx, cy, w, h
-
-def copy_image(src: Path, dst: Path):
-    dst.parent.mkdir(parents=True, exist_ok=True)
-    shutil.copy2(src, dst)
-
-# ---- coverage by scanning exported labels (robust) --------------------
-def compute_coverage(lbl_root: Path):
-    counts = [0]*len(NAMES)
-    for split in ("train","val","test"):
-        for p in (lbl_root/split).glob("*.txt"):
-            with open(p, "r") as f:
-                for line in f:
-                    line=line.strip()
-                    if not line: continue
-                    try:
-                        cid = int(line.split()[0])
-                        if 0 <= cid < len(counts):
-                            counts[cid]+=1
-                    except Exception:
-                        pass
-    return counts
-
-# ===================== MTSD (SIGNS) ======================
-def find_mtsd_paths():
-    # annotations
-    ann_dirs = sorted(glob.glob(str(MTSD_ROOT / "mtsd_fully_annotated_annotation" / "mtsd_v2_fully_annotated" / "annotations")))
-    if not ann_dirs:
-        # accept any *annotated_annotation*/mtsd_v2_fully_annotated/annotations
-        ann_dirs = sorted(glob.glob(str(MTSD_ROOT / "*annotated*_annotation" / "mtsd_v2_fully_annotated" / "annotations")))
-    ann_dir = Path(ann_dirs[0]) if ann_dirs else None
-
-    # images are split across train.0/1/2, val, test (as in your screenshot)
-    img_dirs = []
-    for pat in [
-        "mtsd_fully_annotated_images.train.0",
-        "mtsd_fully_annotated_images.train.1",
-        "mtsd_fully_annotated_images.train.2",
-        "mtsd_fully_annotated_images.val",
-        "mtsd_fully_annotated_images.test",
-    ]:
-        p = MTSD_ROOT / pat
-        if p.is_dir():
-            img_dirs.append(p)
-    return ann_dir, img_dirs
-
-def build_mtsd_image_index(img_dirs):
-    # map 'filename.ext' -> full path
-    idx = {}
-    for d in img_dirs:
-        for ext in ("*.jpg","*.jpeg","*.png"):
-            for p in d.rglob(ext):
-                idx[p.name] = p
-    return idx
-
-def convert_mtsd_signs():
-    ann_dir, img_dirs = find_mtsd_paths()
-    if not ann_dir or not img_dirs:
-        print(f"MTSD: expected {MTSD_ROOT}/.../annotations and image dirs train.0/1/2,val,test, skipping.")
-        return
-
-    print("Converting MTSD (signs)...")
-    img_index = build_mtsd_image_index(img_dirs)
-
-    # use provided splits if present
-    splits_dir = ann_dir.parent / "splits"
-    split_files = {
-        "train": splits_dir / "train.txt",
-        "val":   splits_dir / "val.txt",
-        "test":  splits_dir / "test.txt",
-    }
-
-    for split, split_file in split_files.items():
-        if not split_file.exists():  # if no split files, just skip MTSD (avoid guessing)
-            print(f"MTSD: missing split file {split_file}, skipping this split.")
-            continue
-
-        out_img_dir = OUT / "images" / split
-        out_lbl_dir = OUT / "labels" / split
-        out_img_dir.mkdir(parents=True, exist_ok=True)
-        out_lbl_dir.mkdir(parents=True, exist_ok=True)
-
-        with open(split_file, "r") as f:
-            lines = [ln.strip() for ln in f if ln.strip()]
-        processed = 0
-        for rel in lines:
-            # 'rel' is like 'images/train/xxx.jpg' or similar; use basename to locate both image and json
-            img_name = os.path.basename(rel)
-            img_path = img_index.get(img_name)
-            if not img_path:
-                continue
-
-            # the MTSD annotation json usually shares basename with image
-            json_name = Path(img_name).with_suffix(".json").name
-            json_path = ann_dir / json_name
-            if not json_path.exists():
-                # some zips may prefix names; try glob by stem
-                stem = Path(img_name).stem
-                candidates = list(ann_dir.glob(f"*{stem}*.json"))
-                if candidates:
-                    json_path = candidates[0]
-                else:
-                    continue
-
-            try:
-                data = json.loads(Path(json_path).read_text())
-            except Exception:
-                continue
-
-            # image size (some MTSD jsons might not include W/H reliably, so read the image)
-            try:
-                with Image.open(img_path) as im:
-                    W, H = im.size
-            except Exception:
-                continue
-
-            yolo_lines = []
-            # MTSD bbox style: each object -> { "label": "<string>", "bbox": [x, y, w, h] }  (varies; fallback to x1,y1,x2,y2 keys)
-            objects = data.get("objects") or data.get("labels") or []
-            for obj in objects:
-                label = obj.get("label") or obj.get("class") or obj.get("category") or ""
-                cid = mtsd_label_to_id(label)
-                if cid is None:
-                    continue
-                bbox = obj.get("bbox") or obj.get("box") or None
-                if bbox and len(bbox) >= 4:
-                    # bbox as [x,y,w,h] or [x1,y1,w,h]
-                    x = float(bbox[0]); y = float(bbox[1]); w = float(bbox[2]); h = float(bbox[3])
-                    x1, y1 = x, y
-                    x2, y2 = x + w, y + h
-                else:
-                    # try x1,y1,x2,y2 keys
-                    x1 = obj.get("x1", obj.get("xmin")); y1 = obj.get("y1", obj.get("ymin"))
-                    x2 = obj.get("x2", obj.get("xmax")); y2 = obj.get("y2", obj.get("ymax"))
-                    if None in (x1,y1,x2,y2): 
-                        continue
-                cx, cy, nw, nh = norm_bbox(x1,y1,x2,y2,W,H)
-                yolo_lines.append(yolo_line(cid, cx, cy, nw, nh))
-
-            # copy & write
-            if yolo_lines:
-                copy_image(img_path, out_img_dir / img_name)
-                (out_lbl_dir / (Path(img_name).stem + ".txt")).write_text("".join(yolo_lines))
-                processed += 1
-
-        print(f"MTSD {split}: wrote {processed} labeled images.")
-
-# ===================== BDD100K (USERS + TLIGHTS + LANES) ======================
-# category mapping
-BDD_CAT2DET = {
-    "person": "person",
-    "rider": "person",
-    "bike": "bicycle",
-    "bicycle": "bicycle",
-    "motor": "motorcycle",
-    "motorcycle": "motorcycle",
-    "bus": "bus",
-    "truck": "truck",
-    "car": "car",
+MTSD_TO_SIGN = {
+    "regulatory--stop--g1":"stop",
+    "regulatory--yield--g1":"yield",
+    "regulatory--no-entry--g1":"no_entry",
+    "regulatory--maximum-speed-limit-20--g1":"speed_limit_sign",
+    "regulatory--maximum-speed-limit-30--g1":"speed_limit_sign",
+    "regulatory--maximum-speed-limit-40--g1":"speed_limit_sign",
+    "regulatory--maximum-speed-limit-50--g1":"speed_limit_sign",
+    "regulatory--maximum-speed-limit-60--g1":"speed_limit_sign",
+    "regulatory--maximum-speed-limit-70--g1":"speed_limit_sign",
+    "regulatory--maximum-speed-limit-80--g1":"speed_limit_sign",
+    "information--pedestrians-crossing--g1":"pedestrian_crossing_sign",
+    "regulatory--keep-right--g1":"keep_right",
+    "regulatory--keep-right--g4":"keep_right",
+    "regulatory--keep-left--g1":"keep_left",
+    "regulatory--roundabout--g1":"roundabout",
+    "regulatory--no-left-turn--g1":"no_left_turn",
+    "regulatory--no-right-turn--g1":"no_right_turn",
+    "regulatory--no-u-turn--g1":"no_u_turn",
+    "regulatory--turn-right--g1":"turn_right",
+    "regulatory--go-straight--g1":"go_straight",
+    "regulatory--one-way-straight--g1":"go_straight",
+    "regulatory--one-way-left--g1":"one_way",
+    "regulatory--one-way-left--g3":"one_way",
+    "regulatory--one-way-right--g3":"one_way",
+    "regulatory--no-parking--g1":"no_parking",
+    "regulatory--no-parking--g2":"no_parking",
+    "regulatory--no-parking--g5":"no_parking",
+    "regulatory--no-stopping--g2":"no_stopping",
+    "regulatory--no-stopping--g15":"no_stopping",
+    "regulatory--priority-road--g4":"priority_road",
+    "regulatory--height-limit--g1":"height_limit",
+    "warning--children--g2":"children_crossing",
+    "warning--road-bump--g1":"road_bump",
+    "warning--road-bump--g2":"road_bump",
+    "warning--curve-left--g2":"curve_left",
+    "warning--curve-right--g2":"curve_right",
+    "warning--roadworks--g1":"roadworks",
+    "information--parking--g1":"parking_info",
+    "regulatory--bicycles-only--g1":"bicycles_only",
+    "other-sign":"other_sign",
 }
 
-def bdd_light_to_id(color: str):
-    c = (color or "").lower()
-    if c == "red":    return NAME2ID["traffic_light_red"]
-    if c == "yellow": return NAME2ID["traffic_light_yellow"]
-    if c == "green":  return NAME2ID["traffic_light_green"]
+def mtsd_find_image(stem: str):
+    for root in MTSD_IMG_ROOTS:
+        for ext in MTSD_EXTS:
+            p = root / f"{stem}{ext}"
+            if p.exists(): return p
     return None
 
-def parse_bdd_image_labels(obj):
-    """Handles either per-image JSON (with 'labels') or tracking JSON (with 'frames'). Returns (img_name, W,H, list of [cid,x1,y1,x2,y2])"""
-    # A) per-image JSON (detection 2020): keys often include "name" and "labels"
-    if "labels" in obj:
-        img_name = obj.get("name")
-        W = obj.get("attributes", {}).get("width") or None
-        H = obj.get("attributes", {}).get("height") or None
-        dets = []
-        for lab in obj["labels"]:
-            cat = lab.get("category")
-            if cat == "traffic light":
-                color = lab.get("attributes", {}).get("trafficLightColor", "none")
-                cid = bdd_light_to_id(color)
-                if cid is None: 
-                    continue
-            elif cat == "traffic sign":
-                # BDD does not give sign type => bucket to other_sign
-                cid = NAME2ID["other_sign"]
-            else:
-                mapped = BDD_CAT2DET.get(cat)
-                if not mapped: 
-                    continue
-                cid = NAME2ID[mapped]
-            box = lab.get("box2d")
-            if not box: 
-                continue
-            x1,y1,x2,y2 = box["x1"], box["y1"], box["x2"], box["y2"]
-            dets.append((cid, x1,y1,x2,y2))
-        return img_name, W, H, dets
+def mtsd_split_from_path(p: Path) -> str:
+    s = str(p)
+    if "train" in s: return "train"
+    if "val" in s: return "val"
+    if "test" in s: return "test"
+    return "train"
 
-    # B) tracking-style JSON (with 'frames'): use the single image name from top-level and take first frame's objects
-    if "frames" in obj and obj.get("frames"):
-        img_name = obj.get("name")
-        dets = []
-        W = H = None
-        for lab in obj["frames"][0].get("objects", []):
-            cat = lab.get("category")
-            if cat == "traffic light":
-                color = lab.get("attributes", {}).get("trafficLightColor", "none")
-                cid = bdd_light_to_id(color)
-                if cid is None:
-                    continue
-            elif cat == "traffic sign":
-                cid = NAME2ID["other_sign"]
-            else:
-                mapped = BDD_CAT2DET.get(cat)
-                if not mapped:
-                    continue
-                cid = NAME2ID[mapped]
-            box = lab.get("box2d")
-            if not box:
-                continue
-            x1,y1,x2,y2 = box["x1"], box["y1"], box["x2"], box["y2"]
-            dets.append((cid, x1,y1,x2,y2))
-        return img_name, W, H, dets
+def parse_bbox_generic(obj):
+    # MTSD variants: bbox dicts, lists, or polygons
+    if "bbox" in obj:
+        b = obj["bbox"]
+        if isinstance(b, dict):
+            if {"xmin","ymin","xmax","ymax"} <= set(b.keys()):
+                return float(b["xmin"]), float(b["ymin"]), float(b["xmax"]), float(b["ymax"])
+            if {"x","y","w","h"} <= set(b.keys()):
+                x1 = float(b["x"]); y1 = float(b["y"])
+                return x1, y1, x1+float(b["w"]), y1+float(b["h"])
+        elif isinstance(b, (list,tuple)) and len(b) == 4:
+            x1,y1,a,b2 = map(float, b)
+            return (x1, y1, a, b2) if (a>x1 and b2>y1) else (x1, y1, x1+a, y1+b2)
+    for key in ("polygon","poly2d","points"):
+        if key in obj:
+            pts = obj[key]
+            if isinstance(pts, dict) and {"x","y"} <= set(pts.keys()):
+                xs, ys = pts["x"], pts["y"]
+                if xs and ys: return min(xs), min(ys), max(xs), max(ys)
+            elif isinstance(pts, list) and pts and isinstance(pts[0], (list,tuple)) and len(pts[0])>=2:
+                xs = [p[0] for p in pts]; ys = [p[1] for p in pts]
+                return min(xs), min(ys), max(xs), max(ys)
+    return None
 
-    return None, None, None, []
+def convert_mtsd(limit=None, debug=False):
+    ensure_det_dirs()
+    if MTSD_ANN_DIR is None or not MTSD_ANN_DIR.exists():
+        print(f"MTSD: annotations not found; looked for 'mtsd_v2_fully_annotated/annotations'. Skipping.")
+        return
 
-def convert_bdd_detector():
-    print("Converting BDD100K (road users + traffic lights)...")
-    for split in ("train","val","test"):
-        lbl_dir = BDD_ROOT / "labels" / split
-        img_dir = BDD_ROOT / "images" / split
-        if not (lbl_dir.is_dir() and img_dir.is_dir()):
-            print(f"BDD100K: expected {lbl_dir} and {img_dir}, skipping {split}.")
+    if not MTSD_IMG_ROOTS:
+        print(f"MTSD: no 'mtsd_fully_annotated_images*' volumes found. Skipping.")
+        return
+
+    ann_files = sorted(MTSD_ANN_DIR.glob("*.json"))
+    if limit: ann_files = ann_files[:limit]
+
+    wrote = Counter(); boxes = Counter(); cov = Counter()
+
+    for i, jp in enumerate(ann_files, 1):
+        try:
+            data = json.loads(jp.read_text())
+        except Exception as e:
+            if debug: print(f"[MTSD] JSON error {jp.name}: {e}")
             continue
 
-        out_img_dir = OUT / "images" / split
-        out_lbl_dir = OUT / "labels" / split
-        out_img_dir.mkdir(parents=True, exist_ok=True)
-        out_lbl_dir.mkdir(parents=True, exist_ok=True)
-
-        files = list(lbl_dir.glob("*.json"))
-        processed = 0
-        for i, jp in enumerate(files, 1):
-            try:
-                obj = json.loads(jp.read_text())
-            except Exception:
-                continue
-
-            img_name, W, H, dets = parse_bdd_image_labels(obj)
-            if not img_name or not dets:
-                continue
-
-            # infer image path (jpg or png)
-            for ext in (".jpg",".png",".jpeg"):
-                candidate = img_dir / (img_name + ext if not img_name.lower().endswith(ext) else img_name)
-                if candidate.exists():
-                    img_path = candidate
-                    break
-            else:
-                # sometimes 'name' already includes extension
-                candidate = img_dir / img_name
-                if candidate.exists():
-                    img_path = candidate
-                else:
-                    continue
-
-            if W is None or H is None:
-                try:
-                    with Image.open(img_path) as im:
-                        W, H = im.size
-                except Exception:
-                    continue
-
-            yolo_lines = []
-            for cid,x1,y1,x2,y2 in dets:
-                cx,cy,w,h = norm_bbox(x1,y1,x2,y2,W,H)
-                yolo_lines.append(yolo_line(cid,cx,cy,w,h))
-
-            if yolo_lines:
-                copy_image(img_path, out_img_dir / Path(img_path).name)
-                (out_lbl_dir / (Path(img_path).stem + ".txt")).write_text("".join(yolo_lines))
-                processed += 1
-
-            if i % 5000 == 0:
-                print(f"BDD100K {split}: processed {i} annotations...")
-
-        print(f"BDD100K {split}: wrote {processed} labeled images.")
-
-# ---- BDD lanes (rasterize poly2d to mask PNG) ------------------------
-LANE_CLASSES = [
-    "lane/single white","lane/single yellow","lane/double white","lane/double yellow",
-    "lane/road curb","lane/crosswalk","lane/single other","lane/double other"
-]
-LANE_COLOR = 255  # binary mask (1 class). If you want multi-class, map per type.
-
-def export_bdd_lanes():
-    print("Exporting BDD100K lane masks...")
-    for split in ("train","val","test"):
-        lbl_dir = BDD_ROOT / "labels" / split
-        img_dir = BDD_ROOT / "images" / split
-        if not (lbl_dir.is_dir() and img_dir.is_dir()):
-            print(f"LANES {split}: expected {lbl_dir} and {img_dir}, skipping.")
+        stem = jp.stem
+        img_path = mtsd_find_image(stem)
+        if img_path is None:
+            if debug: print(f"[MTSD] image missing for {stem}")
             continue
 
-        out_mask_dir = LANE_OUT / split
-        ensure_clean_dir(out_mask_dir)
+        split = mtsd_split_from_path(img_path)
+        W,H = open_image_size(img_path)
 
-        files = list(lbl_dir.glob("*.json"))
-        written = 0
-        for i, jp in enumerate(files, 1):
+        objs = data.get("objects", data.get("labels", []))
+        lines = []
+        for obj in objs:
+            lab = obj.get("label") or obj.get("classTitle") or obj.get("category") or ""
+            if not isinstance(lab, str): continue
+            lab = lab.strip()
+            canon = MTSD_TO_SIGN.get(lab, "other_sign")
+            if canon not in CLASS_TO_ID: continue
+            bb = parse_bbox_generic(obj)
+            if not bb: continue
+            x1,y1,x2,y2 = bb
+            x1 = max(0, min(x1, W-1)); x2 = max(0, min(x2, W-1))
+            y1 = max(0, min(y1, H-1)); y2 = max(0, min(y2, H-1))
+            if x2<=x1 or y2<=y1: continue
+            if (x2-x1)<2 or (y2-y1)<2: continue
+            lines.append(yolo_line(CLASS_TO_ID[canon], x1,y1,x2,y2, W,H))
+            cov[canon]+=1
+
+        if not lines: continue
+        out_img = OUT/"images"/split/img_path.name
+        out_lbl = OUT/"labels"/split/(img_path.stem + ".txt")
+        copy_image(img_path, out_img)
+        out_lbl.write_text("".join(lines))
+        wrote[split]+=1; boxes[split]+=len(lines)
+
+        if debug and i % 500 == 0:
+            print(f"[MTSD] {i}/{len(ann_files)} wrote so far: {dict(wrote)}")
+
+    print("MTSD summary:")
+    for s in ("train","val","test"):
+        print(f"  {s:5s}: wrote {wrote[s]} labeled images, {boxes[s]} boxes")
+    print("\nMTSD coverage (instances per class):")
+    if cov:
+        for cname in sorted(cov, key=lambda k: CLASS_TO_ID[k]):
+            print(f"{CLASS_TO_ID[cname]:2d} {cname:24s}: {cov[cname]}")
+    else:
+        print("  (no boxes kept; check paths or mapping)")
+
+# ---------------------------------------------------------------------
+# BDD100K (road users + traffic lights [+ optional traffic signs])
+# ---------------------------------------------------------------------
+def bdd_get_objects(record: dict):
+    # Support both older "frames" and flatter "objects"/"labels"
+    if "frames" in record and record["frames"]:
+        return record["frames"][0].get("objects", [])
+    if "objects" in record:
+        return record["objects"]
+    if "labels" in record:
+        return record["labels"]
+    return []
+
+def convert_bdd(limit=None, include_bdd_signs_as_other=True, debug=False):
+    ensure_det_dirs()
+    bdd_root = RAW / "bdd100k"
+    img_root = bdd_root / "images"
+    lbl_root = bdd_root / "labels"
+    if not (img_root.exists() and lbl_root.exists()):
+        print(f"BDD100K: expected {img_root} and {lbl_root}. Skipping.")
+        return
+
+    cov = Counter(); wrote = Counter(); boxes = Counter()
+    cat_map = {
+        "person":"person",
+        "rider":"person",   # treat rider as person
+        "bike":"bicycle",
+        "motor":"motorcycle",
+        "car":"car",
+        "truck":"truck",
+        "bus":"bus",
+        # 'train' not in our CLASSES — skip
+    }
+
+    for split in ("train","val","test"):
+        lbl_dir = lbl_root / split
+        img_dir = img_root / split
+        if not lbl_dir.exists() or not img_dir.exists():
+            print(f"BDD100K: missing split {split} — skipping.")
+            continue
+
+        jsons = sorted(lbl_dir.glob("*.json"))
+        if limit: jsons = jsons[:limit]
+
+        for i, jp in enumerate(jsons, 1):
             try:
-                obj = json.loads(jp.read_text())
-            except Exception:
+                rec = json.loads(jp.read_text())
+            except Exception as e:
+                if debug: print(f"[BDD] JSON error {jp.name}: {e}")
                 continue
 
-            # we need the image name regardless of per-image or frames style
-            img_name = obj.get("name")
-            if not img_name:
-                continue
-
-            # find the corresponding image to get size
+            stem = jp.stem
             img_path = None
-            for ext in (".jpg",".png",".jpeg"):
-                candidate = img_dir / (img_name + ext if not img_name.lower().endswith(ext) else img_name)
-                if candidate.exists():
-                    img_path = candidate
-                    break
+            for ext in (".jpg",".png",".JPG",".PNG"):
+                p = img_dir / f"{stem}{ext}"
+                if p.exists(): img_path = p; break
             if img_path is None:
-                candidate = img_dir / img_name
-                if candidate.exists():
-                    img_path = candidate
+                if debug: print(f"[BDD] image missing for {stem}")
+                continue
+
+            W,H = open_image_size(img_path)
+            objs = bdd_get_objects(rec)
+            lines = []
+
+            for obj in objs:
+                cat = obj.get("category","")
+                # traffic light with color
+                if cat == "traffic light":
+                    color = obj.get("attributes",{}).get("trafficLightColor","none")
+                    if color == "red":    cls = "traffic_light_red"
+                    elif color == "yellow": cls = "traffic_light_yellow"
+                    elif color == "green":  cls = "traffic_light_green"
+                    else: continue  # skip 'none'
+                elif cat == "traffic sign":
+                    if not include_bdd_signs_as_other:
+                        continue
+                    cls = "other_sign"
                 else:
+                    cls = cat_map.get(cat)
+                    if cls is None:
+                        continue
+
+                # bbox
+                bb = obj.get("box2d")
+                if not bb or not {"x1","y1","x2","y2"} <= set(bb.keys()):
                     continue
+                x1,y1,x2,y2 = float(bb["x1"]), float(bb["y1"]), float(bb["x2"]), float(bb["y2"])
+                x1 = max(0, min(x1, W-1)); x2 = max(0, min(x2, W-1))
+                y1 = max(0, min(y1, H-1)); y2 = max(0, min(y2, H-1))
+                if x2<=x1 or y2<=y1: continue
+                if (x2-x1)<2 or (y2-y1)<2: continue
+
+                lines.append(yolo_line(CLASS_TO_ID[cls], x1,y1,x2,y2, W,H))
+                cov[cls]+=1
+
+            if not lines: continue
+            out_img = OUT/"images"/split/img_path.name
+            out_lbl = OUT/"labels"/split/(img_path.stem + ".txt")
+            copy_image(img_path, out_img)
+            out_lbl.write_text("".join(lines))
+            wrote[split]+=1; boxes[split]+=len(lines)
+
+            if debug and i % 5000 == 0:
+                print(f"[BDD] {split}: processed {i}/{len(jsons)} ...")
+
+        print(f"BDD100K {split}: wrote {wrote[split]} labeled images, {boxes[split]} boxes")
+
+    print("\nBDD100K coverage (instances per class):")
+    if cov:
+        for cname in sorted(cov, key=lambda k: CLASS_TO_ID[k]):
+            print(f"{CLASS_TO_ID[cname]:2d} {cname:24s}: {cov[cname]}")
+    else:
+        print("  (no boxes kept; check paths or mapping)")
+
+# ---------------------------------------------------------------------
+# BDD100K lane masks (optional)
+# ---------------------------------------------------------------------
+def poly2d_to_points(poly2d):
+    pts = []
+    if not isinstance(poly2d, list) or not poly2d:
+        return pts
+    first = poly2d[0]
+    if isinstance(first, dict) and "vertices" in first:
+        for comp in poly2d:
+            for x,y in comp.get("vertices", []):
+                pts.append((float(x), float(y)))
+    elif isinstance(first, (list,tuple)) and len(first) >= 2:
+        for item in poly2d:
+            if isinstance(item, (list,tuple)) and len(item) >= 2:
+                pts.append((float(item[0]), float(item[1])))
+    return pts
+
+def export_bdd_lanes(lanes_out: Path, debug=False):
+    bdd_root = RAW / "bdd100k"
+    img_root = bdd_root / "images"
+    lbl_root = bdd_root / "labels"
+    if not (img_root.exists() and lbl_root.exists()):
+        print(f"BDD100K lanes: expected {img_root} and {lbl_root}, skipping.")
+        return
+
+    for split in ("train","val","test"):
+        out_dir = lanes_out / split
+        out_dir.mkdir(parents=True, exist_ok=True)
+        lbl_dir = lbl_root / split
+        img_dir = img_root / split
+        if not lbl_dir.exists() or not img_dir.exists():
+            print(f"BDD100K lanes: split {split} missing, skipping.")
+            continue
+
+        jsons = sorted(lbl_dir.glob("*.json"))
+        count = 0
+        for i, jp in enumerate(jsons, 1):
+            try:
+                rec = json.loads(jp.read_text())
+            except Exception:
+                continue
+
+            stem = jp.stem
+            img_path = None
+            for ext in (".jpg",".png",".JPG",".PNG"):
+                p = img_dir / f"{stem}{ext}"
+                if p.exists(): img_path = p; break
+            if img_path is None:
+                continue
 
             try:
-                with Image.open(img_path) as im:
-                    W, H = im.size
+                W,H = open_image_size(img_path)
             except Exception:
                 continue
 
             mask = Image.new("L", (W,H), 0)
             draw = ImageDraw.Draw(mask)
-
-            # gather polylines from either 'labels' (per-image) or first frame in 'frames'
-            polys = []
-            if "labels" in obj:
-                for lab in obj["labels"]:
-                    if lab.get("category") in LANE_CLASSES and "poly2d" in lab:
-                        polys.extend(lab["poly2d"])
-            elif obj.get("frames"):
-                for lab in obj["frames"][0].get("objects", []):
-                    if lab.get("category") in LANE_CLASSES and "poly2d" in lab:
-                        polys.extend(lab["poly2d"])
-
-            # poly2d format: each polygon is a list like [ [x, y, 'L' or 'C'], ... ]
-            for poly in polys:
-                pts = []
-                for item in poly:
-                    if isinstance(item, (list, tuple)) and len(item) >= 2:
-                        x, y = float(item[0]), float(item[1])
-                        pts.append((x,y))
-                if len(pts) >= 2:
-                    draw.line(pts, fill=LANE_COLOR, width=3)
-
-            mask.save(out_mask_dir / (Path(img_path).stem + ".png"))
-            written += 1
+            objs = bdd_get_objects(rec)
+            drew = False
+            for obj in objs:
+                cat = obj.get("category","")
+                if isinstance(cat,str) and cat.startswith("lane/"):
+                    poly2d = obj.get("poly2d")
+                    if not poly2d: continue
+                    pts = poly2d_to_points(poly2d)
+                    if len(pts) >= 3:
+                        draw.polygon(pts, outline=255, fill=255)
+                        drew = True
+            if drew:
+                mask.save(out_dir / f"{stem}.png")
+                count += 1
 
             if i % 2000 == 0:
-                print(f"LANES {split}: exported {i} masks...")
+                print(f"LANES {split}: exported {count} masks...")
 
-        print(f"LANES {split}: exported {written} masks.")
+        print(f"LANES {split}: exported {count} masks.")
 
-# ===================== main ======================
+# ---------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------
 def main():
-    # clean detector output dirs
-    ensure_clean_dir(OUT / "images" / "train")
-    ensure_clean_dir(OUT / "images" / "val")
-    ensure_clean_dir(OUT / "images" / "test")
-    ensure_clean_dir(OUT / "labels" / "train")
-    ensure_clean_dir(OUT / "labels" / "val")
-    ensure_clean_dir(OUT / "labels" / "test")
+    ap = argparse.ArgumentParser(description="Convert MTSD + BDD100K to YOLO; optionally export BDD lane masks.")
+    ap.add_argument("--clean", action="store_true", help="remove datasets/traffic/images and labels before writing")
+    ap.add_argument("--limit_mtsd", type=int, default=None, help="limit MTSD JSONs")
+    ap.add_argument("--limit_bdd", type=int, default=None, help="limit BDD JSONs per split")
+    ap.add_argument("--skip_bdd_signs", action="store_true",
+                    help="do not use BDD 'traffic sign' boxes (MTSD will supply sign types)")
+    ap.add_argument("--export_lanes", action="store_true", help="also export BDD lane masks")
+    ap.add_argument("--lanes_out", type=str, default=str(PROJECT_ROOT / "datasets" / "lanes"),
+                    help="lane masks output folder")
 
-    # MTSD (signs)
-    convert_mtsd_signs()
+    ap.add_argument("--debug", action="store_true", help="verbose logs")
+    args = ap.parse_args()
 
-    # BDD road users + traffic lights
-    convert_bdd_detector()
+    if args.clean:
+        for d in (OUT/"images", OUT/"labels"):
+            if d.exists(): shutil.rmtree(d)
+        print("Cleaned datasets/traffic/{images,labels}")
 
-    # BDD lanes
-    export_bdd_lanes()
+    print("Converting MTSD (signs)...")
+    convert_mtsd(limit=args.limit_mtsd, debug=args.debug)
 
-    # coverage
-    print("\nCoverage (instances per class) by scanning exported labels:")
-    counts = compute_coverage(OUT / "labels")
-    for i, n in enumerate(NAMES):
-        print(f"{i:2d} {n:25s}: {counts[i]}")
+    print("Converting BDD100K (road users + traffic lights)...")
+    convert_bdd(limit=args.limit_bdd, include_bdd_signs_as_other=not args.skip_bdd_signs, debug=args.debug)
+
+    if args.export_lanes:
+        print("Exporting BDD100K lane masks...")
+        export_bdd_lanes(Path(args.lanes_out), debug=args.debug)
 
 if __name__ == "__main__":
     main()
