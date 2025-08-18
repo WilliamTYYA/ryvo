@@ -149,7 +149,7 @@ def parse_bbox_generic(obj):
                 return min(xs), min(ys), max(xs), max(ys)
     return None
 
-def convert_mtsd(limit=None, debug=False):
+def convert_mtsd(limit=None, debug=False, args=None):
     ensure_det_dirs()
     if MTSD_ANN_DIR is None or not MTSD_ANN_DIR.exists():
         print(f"MTSD: annotations not found; looked for 'mtsd_v2_fully_annotated/annotations'. Skipping.")
@@ -186,6 +186,10 @@ def convert_mtsd(limit=None, debug=False):
             lab = obj.get("label") or obj.get("classTitle") or obj.get("category") or ""
             if not isinstance(lab, str): continue
             lab = lab.strip()
+            if args and getattr(args, "mtsd_drop_other_sign", False) and lab == "other-sign":
+                continue
+            if args and getattr(args, "mtsd_drop_complementary", False) and lab.startswith("complementary--"):
+                continue
             canon = MTSD_TO_SIGN.get(lab, "other_sign")
             if canon not in CLASS_TO_ID: continue
             bb = parse_bbox_generic(obj)
@@ -423,6 +427,11 @@ def main():
     ap.add_argument("--export_lanes", action="store_true", help="also export BDD lane masks")
     ap.add_argument("--lanes_out", type=str, default=str(PROJECT_ROOT / "datasets" / "lanes"),
                     help="lane masks output folder")
+    
+    ap.add_argument("--mtsd_drop_other_sign", action="store_true",
+                help="Do not include MTSD 'other-sign' boxes.")
+    ap.add_argument("--mtsd_drop_complementary", action="store_true",
+                help="Drop MTSD labels starting with 'complementary--' (supplementary plates).")
 
     ap.add_argument("--debug", action="store_true", help="verbose logs")
     args = ap.parse_args()
@@ -433,7 +442,7 @@ def main():
         print("Cleaned datasets/traffic/{images,labels}")
 
     print("Converting MTSD (signs)...")
-    convert_mtsd(limit=args.limit_mtsd, debug=args.debug)
+    convert_mtsd(limit=args.limit_mtsd, debug=args.debug, args=args)
 
     print("Converting BDD100K (road users + traffic lights)...")
     convert_bdd(limit=args.limit_bdd, include_bdd_signs_as_other=not args.skip_bdd_signs, debug=args.debug)
