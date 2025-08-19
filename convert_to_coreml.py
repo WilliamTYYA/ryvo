@@ -15,6 +15,18 @@ Usage examples:
 import argparse, os, sys
 import tensorflow as tf
 import coremltools as ct
+from tensorflow.keras import layers
+
+# Try to import the custom class from your project; fall back to a minimal definition.
+try:
+    from custom_yolo import SiLU as _SiLU
+except Exception:
+    @tf.keras.saving.register_keras_serializable()
+    class _SiLU(layers.Layer):
+        def call(self, x):
+            return tf.nn.silu(x)
+
+CUSTOM_OBJECTS = {"SiLU": _SiLU}
 
 def base_name(tensor_name: str) -> str:
     # Keras tensors often look like 'input_1:0' → return 'input_1'
@@ -39,7 +51,12 @@ def main():
         sys.exit(f"[error] Keras model not found: {args.keras}")
 
     print(f"[load] {args.keras}")
-    model = tf.keras.models.load_model(args.keras, compile=False)
+    model = tf.keras.models.load_model(
+        args.keras,
+        compile=False,
+        custom_objects=CUSTOM_OBJECTS,
+        safe_mode=False,   # allow custom classes
+    )
 
     # ---- Inspect I/O ----
     in_t = model.inputs[0]
@@ -78,6 +95,7 @@ def main():
     print(f"[convert] to mlprogram, precision={precision.name}, input={img_size}x{img_size}, scale={args.scale}")
     mlmodel = ct.convert(
         model,
+        source="tensorflow",
         inputs=[img_input],
         convert_to="mlprogram",
         compute_precision=precision,
