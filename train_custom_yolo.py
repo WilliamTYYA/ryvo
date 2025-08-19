@@ -3,7 +3,7 @@ from custom_yolo import train_cli
 
 def main():
     p = argparse.ArgumentParser(
-        description="Train custom YOLO-like model (2-scale FPN, focal+GIoU) on YOLO-formatted data."
+        description="Train custom YOLO-like model (C2f + SPPF + FPN, 2 heads) on YOLO-formatted data."
     )
 
     # Data & IO
@@ -12,16 +12,14 @@ def main():
     p.add_argument("--out", default="runs/custom_yolo",
                    help="Directory to save checkpoints and final model.")
     p.add_argument("--cache", action="store_true",
-                   help="Cache tf.data pipeline in RAM (use for subsets, not full 70GB).")
+                   help="Cache tf.data pipeline in RAM (use for subsets).")
     p.add_argument("--limit", type=int, default=None,
-                   help="Limit number of training images (e.g., 2000 for quick runs).")
+                   help="Limit number of training images (e.g., 20000 for quick runs).")
     p.add_argument("--deterministic", action="store_true",
                    help="Make tf.data deterministic (slightly slower but reproducible).")
 
-    # Model / image
-    p.add_argument("--img", type=int, default=512, help="Square image size.")
-    p.add_argument("--grid", type=int, default=16,
-                   help="Main prediction grid size (model also predicts at 2x this).")
+    # Image / model
+    p.add_argument("--img", type=int, default=512, help="Square image size (grid derived as img//16).")
 
     # Training
     p.add_argument("--batch", type=int, default=32, help="Batch size.")
@@ -39,7 +37,7 @@ def main():
     p.add_argument("--max_lr", type=float, default=1e-3, help="Max LR for one-cycle.")
     p.add_argument("--div", type=float, default=25.0, help="div_factor for one-cycle (base_lr = max_lr/div).")
     p.add_argument("--final_div", type=float, default=1e4, help="final_div_factor for one-cycle.")
-    p.add_argument("--pct_start", type=float, default=0.3, help="Warmup % of total steps for one-cycle.")
+    p.add_argument("--pct_start", type=float, default=0.3, help="Warmup %% of total steps for one-cycle.")
 
     # Optimizer
     p.add_argument("--optimizer", default="adamw", choices=["adamw", "adam", "sgd"],
@@ -48,10 +46,10 @@ def main():
 
     a = p.parse_args()
 
+    # Grid is derived inside custom_yolo: G = a.img // 16 (and 2G for the fine head)
     train_cli(
         yaml_path=a.yaml,
         img_size=a.img,
-        grid_size=a.grid,
         batch=a.batch,
         epochs=a.epochs,
         cache=a.cache,
@@ -69,18 +67,5 @@ def main():
         deterministic=a.deterministic,
     )
 
-
 if __name__ == "__main__":
     main()
-
-# Cosine (Ultralytics-style) + AdamW + grid 32
-#python train_custom_yolo.py --yaml datasets/traffic/traffic.yaml \
-#  --sched cosine --img 512 --grid 32 --batch 80 --epochs 10 --limit 20000 \
-#  --lr0 1e-3 --lrf 0.01 --warmup_epochs 3 --patience 6 \
-#  --optimizer adamw --wd 0.01
-
-# One-cycle + AdamW + grid 24
-#python train_custom_yolo.py --yaml datasets/traffic/traffic.yaml \
-#  --sched onecycle --img 512 --grid 24 --batch 80 --epochs 10 --limit 20000 \
-#  --max_lr 1e-3 --div 25 --final_div 1e4 --pct_start 0.3 --patience 6 \
-#  --optimizer adamw --wd 0.01
