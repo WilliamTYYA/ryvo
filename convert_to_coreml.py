@@ -130,11 +130,29 @@ def main():
     mlmodel.save(args.out)
     print(f"[done] Saved Core ML model → {args.out}")
 
-    # Print final Core ML interface summary
+    # Print final Core ML interface summary (robust to image/multiarray types)
     spec = mlmodel.get_spec()
-    coreml_in = [f"{f.name} {list(f.type.imageType.shape)}" if f.type.WhichOneof("Type")=="imageType"
-                 else f"{f.name}" for f in spec.description.input]
-    coreml_out = [f.name for f in spec.description.output]
+
+    def _fmt_feature(feat):
+        tname = feat.type.WhichOneof("Type")
+        if tname == "imageType":
+            it = feat.type.imageType
+            # width/height may be 0 (flexible) in some specs
+            w = getattr(it, "width", 0) or "?"
+            h = getattr(it, "height", 0) or "?"
+            cs = getattr(it, "colorSpace", None)
+            cs_name = "RGB" if cs == 10 else ("GRAYSCALE" if cs == 5 else "IMG")
+            return f"{feat.name} Image[{h}x{w} {cs_name}]"
+        elif tname == "multiArrayType":
+            mt = feat.type.multiArrayType
+            # shape may be empty when flexible; handle both cases
+            shp = list(mt.shape) if getattr(mt, "shape", None) else []
+            return f"{feat.name} MultiArray{shp if shp else '[flexible]'}"
+        else:
+            return f"{feat.name} {tname}"
+
+    coreml_in  = [_fmt_feature(f) for f in spec.description.input]
+    coreml_out = [_fmt_feature(f) for f in spec.description.output]
     print(f"[coreml] inputs : {coreml_in}")
     print(f"[coreml] outputs: {coreml_out}")
 

@@ -1,0 +1,46 @@
+# Root of the dataset (this file sits in your repo root)
+path: .
+
+train: images/train
+val: images/val
+test: images/test
+
+nc: 37
+names:
+  - person
+  - bicycle
+  - car
+  - motorcycle
+  - bus
+  - truck
+  - traffic_light_red
+  - traffic_light_yellow
+  - traffic_light_green
+  - stop
+  - yield
+  - no_entry
+  - speed_limit_sign
+  - pedestrian_crossing_sign
+  - no_left_turn
+  - no_right_turn
+  - no_u_turn
+  - one_way
+  - turn_left
+  - turn_right
+  - go_straight
+  - roundabout
+  - keep_right
+  - keep_left
+  - pass_either_side
+  - priority_road
+  - no_parking
+  - no_stopping
+  - height_limit
+  - children_crossing
+  - road_bump
+  - curve_left
+  - curve_right
+  - roadworks
+  - parking_info
+  - bicycles_only
+  - other_sign

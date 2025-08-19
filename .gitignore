@@ -1,12 +1,15 @@
 # Datasets - as requested
-datasets/
+datasets/traffic/images
+datasets/traffic/labels
+datasets/raw
+tmp_savedmodel_for_coreml/
 
 # Python cache
 __pycache__/
 *.pyc
 
 # ML training runs and logs
-runs/
+#runs/
 
 # Environment variables
 .env
