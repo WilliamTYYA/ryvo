@@ -4,22 +4,22 @@ convert_to_coreml.py
 Convert a Keras .keras model to a Core ML .mlmodel ready for Xcode.
 
 Usage examples:
-  python scripts/convert_to_coreml.py --keras best_384_G24.keras --img 384 \
-      --out Models/CustomYOLOAdvanced.mlmodel --fp16
-
-  # If your preprocessing already feeds 0..1 floats to Core ML (rare on iOS),
-  # set --scale 1.0 so the converter doesn't divide by 255:
-  python scripts/convert_to_coreml.py --keras best_384_G24.keras --img 384 --scale 1.0
+  python convert_to_coreml.py \
+    --keras runs/custom_yolo/best_384_G24.keras \
+    --img 384 \
+    --out Models/CustomYOLO.mlmodel \
+    --fp16
 """
 
-import argparse, os, sys
+import argparse, os, sys, shutil
 import tensorflow as tf
 import coremltools as ct
 from tensorflow.keras import layers
 
-# Try to import the custom class from your project; fall back to a minimal definition.
+# ---- Handle custom layers (e.g., SiLU) ----
 try:
-    from custom_yolo import SiLU as _SiLU
+    # If your project already defines/exports SiLU:
+    from custom_yolo import SiLU as _SiLU  # noqa
 except Exception:
     @tf.keras.saving.register_keras_serializable()
     class _SiLU(layers.Layer):
@@ -43,8 +43,6 @@ def main():
     ap.add_argument("--bias_g", type=float, default=0.0, help="Green bias")
     ap.add_argument("--bias_b", type=float, default=0.0, help="Blue bias")
     ap.add_argument("--fp16", action="store_true", help="Use float16 weights (smaller & faster)")
-    ap.add_argument("--rename_outputs", action="store_true",
-                    help="Rename first two outputs to 'out_m' and 'out_s' (if names differ)")
     args = ap.parse_args()
 
     if not os.path.exists(args.keras):
@@ -81,35 +79,51 @@ def main():
     if ishape[-1] != 3:
         print(f"[warn] Input channels != 3 ({ishape[-1]}). This script assumes RGB.")
 
-    # ---- Build Core ML input description ----
+    # ---- Build Core ML input description (image input) ----
     img_input = ct.ImageType(
         name=in_name,
-        shape=(1, img_size, img_size, 3),   # NHWC
+        shape=(1, img_size, img_size, 3),   # NHWC with batch=1
         color_layout="RGB",
         scale=args.scale,
         bias=[args.bias_r, args.bias_g, args.bias_b],
     )
 
-    # ---- Convert ----
+    # ---- Export a SavedModel with an explicit serving signature ----
+    # This bypasses Keras 2.x internals coremltools expects, and is stable with Keras 3 / TF 2.19.
+    tmp_sm = "tmp_savedmodel_for_coreml"
+    if os.path.isdir(tmp_sm):
+        shutil.rmtree(tmp_sm)
+
+    sig = tf.TensorSpec([1, img_size, img_size, 3], tf.float32, name=in_name)
+
+    @tf.function(input_signature=[sig])
+    def serving_fn(x):
+        y = model(x, training=False)
+        # Return stable, named outputs for Core ML
+        if isinstance(y, dict):
+            return y
+        elif isinstance(y, (list, tuple)):
+            # Use conventional YOLO names for two heads if available
+            if len(y) >= 2:
+                return {"out_m": y[0], "out_s": y[1]}
+            return {"out": y[0]}
+        else:
+            return {"out": y}
+
+    tf.saved_model.save(model, tmp_sm, signatures={"serving_default": serving_fn})
+    print(f"[savedmodel] exported → {tmp_sm}")
+
+    # ---- Convert SavedModel → Core ML ----
     precision = ct.precision.FLOAT16 if args.fp16 else ct.precision.FLOAT32
     print(f"[convert] to mlprogram, precision={precision.name}, input={img_size}x{img_size}, scale={args.scale}")
     mlmodel = ct.convert(
-        model,
+        tmp_sm,
         source="tensorflow",
         inputs=[img_input],
         convert_to="mlprogram",
         compute_precision=precision,
-        compute_units=ct.ComputeUnit.ALL,  # use ANE + GPU + CPU
+        compute_units=ct.ComputeUnit.ALL,  # ANE+GPU+CPU on Apple Silicon
     )
-
-    # (Optional) Standardize output names to 'out_m'/'out_s' if user wants
-    if args.rename_outputs and len(out_names) >= 2:
-        try:
-            ct.utils.rename_feature(mlmodel, out_names[0], "out_m")
-            ct.utils.rename_feature(mlmodel, out_names[1], "out_s")
-            print(f"[info] Renamed outputs: {out_names[:2]} -> ['out_m','out_s']")
-        except Exception as e:
-            print(f"[warn] Could not rename outputs: {e}")
 
     # ---- Save ----
     os.makedirs(os.path.dirname(args.out) or ".", exist_ok=True)
