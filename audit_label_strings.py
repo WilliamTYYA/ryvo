@@ -175,43 +175,43 @@ def scan_bdd(root: Path, top: int):
 
 def main():
     ap = argparse.ArgumentParser(description="Audit raw label strings in LISA / MTSD / BSTLD / BDD100K")
-    ap.add_argument("--lisa",  type=str, help="Path to LISA root")
+    # ap.add_argument("--lisa",  type=str, help="Path to LISA root")
     ap.add_argument("--mtsd",  type=str, help="Path to MTSD root")
-    ap.add_argument("--bstld", type=str, help="Path to BSTLD root")
+    # ap.add_argument("--bstld", type=str, help="Path to BSTLD root")
     ap.add_argument("--bdd",   type=str, help="Path to BDD100K root")
     ap.add_argument("--top",   type=int, default=60, help="Top-N to display")
     args = ap.parse_args()
 
     cwd = Path.cwd()
 
-    LISA  = first_existing([args.lisa] if args.lisa else [
-        cwd/"datasets/raw/lisa", cwd/"../datasets/raw/lisa", cwd/"lisa"
-    ])
+    # LISA  = first_existing([args.lisa] if args.lisa else [
+    #     cwd/"datasets/raw/lisa", cwd/"../datasets/raw/lisa", cwd/"lisa"
+    # ])
     MTSD  = first_existing([args.mtsd] if args.mtsd else [
         cwd/"datasets/raw/mtsd", cwd/"../datasets/raw/mtsd", cwd/"mtsd"
     ])
-    BSTLD = first_existing([args.bstld] if args.bstld else [
-        cwd/"datasets/raw/bstld", cwd/"../datasets/raw/bstld", cwd/"bstld"
-    ])
+    # BSTLD = first_existing([args.bstld] if args.bstld else [
+    #     cwd/"datasets/raw/bstld", cwd/"../datasets/raw/bstld", cwd/"bstld"
+    # ])
     BDD   = first_existing([args.bdd] if args.bdd else [
         cwd/"datasets/raw/bdd100k", cwd/"../datasets/raw/bdd100k", cwd/"bdd100k"
     ])
 
-    if not any([LISA, MTSD, BSTLD, BDD]):
+    if not any([MTSD, BDD]):
         print("Nothing to audit: no dataset roots found.\n"
               "Pass explicit paths, e.g.:\n"
               "  python audit_label_strings.py --lisa '/abs/path/LISA' --mtsd '/abs/path/mtsd' "
               "--bstld '/abs/path/bstld' --bdd '/abs/path/bdd100k'")
         return
 
-    if LISA:  scan_lisa(LISA, args.top)
-    else:     print("\n[LISA] SKIP (not found)")
+    # if LISA:  scan_lisa(LISA, args.top)
+    # else:     print("\n[LISA] SKIP (not found)")
 
     if MTSD:  scan_mtsd(MTSD, args.top)
     else:     print("\n[MTSD] SKIP (not found)")
 
-    if BSTLD: scan_bstld_supervisely(BSTLD, args.top)
-    else:     print("\n[BSTLD] SKIP (not found)")
+    # if BSTLD: scan_bstld_supervisely(BSTLD, args.top)
+    # else:     print("\n[BSTLD] SKIP (not found)")
 
     if BDD:   scan_bdd(BDD, args.top)
     else:     print("\n[BDD100K] SKIP (not found)")
