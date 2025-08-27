@@ -4,7 +4,7 @@
 import argparse, json, shutil
 from pathlib import Path
 from glob import glob
-from collections import Counter, defaultdict
+from collections import Counter
 from PIL import Image, ImageDraw
 
 # ---------------------------------------------------------------------
@@ -38,25 +38,22 @@ def yolo_line(cls_id, x1, y1, x2, y2, W, H) -> str:
     return f"{cls_id} {cx:.6f} {cy:.6f} {bw:.6f} {bh:.6f}\n"
 
 # ---------------------------------------------------------------------
-# Unified class list (must match your traffic.yaml names order)
+# Unified class list (must match traffic.yaml: names:)
+# Reduced to core users + lights + key signs (no other_sign / bumps / height-limit / bicycles-only)
 # ---------------------------------------------------------------------
 CLASSES = [
-    "person","bicycle","car","motorcycle","bus","truck",
+    "person","car",
     "traffic_light_red","traffic_light_yellow","traffic_light_green",
-    # signs:
     "stop","yield","no_entry","speed_limit_sign","pedestrian_crossing_sign",
     "no_left_turn","no_right_turn","no_u_turn","one_way","turn_left","turn_right",
     "go_straight","roundabout","keep_right","keep_left","pass_either_side",
-    "priority_road","no_parking","no_stopping","height_limit","children_crossing",
-    "road_bump","curve_left","curve_right","roadworks","parking_info","bicycles_only",
-    "other_sign",
+    "children_crossing","curve_left","curve_right",
 ]
 CLASS_TO_ID = {c: i for i, c in enumerate(CLASSES)}
 
 # ---------------------------------------------------------------------
 # MTSD (signs) conversion
 # ---------------------------------------------------------------------
-# Try to resolve the annotations directory robustly
 def _resolve_mtsd_ann_dir():
     explicit = RAW / "mtsd" / "mtsd_fully_annotated_annotation" / "mtsd_v2_fully_annotated" / "annotations"
     if explicit.exists():
@@ -68,47 +65,132 @@ MTSD_ANN_DIR = _resolve_mtsd_ann_dir()
 MTSD_IMG_ROOTS = sorted(map(Path, glob(str(RAW / "mtsd" / "mtsd_fully_annotated_images*"))))
 MTSD_EXTS = (".jpg", ".jpeg", ".png", ".JPG", ".JPEG", ".PNG")
 
+# Your consolidated mapping (unmapped labels are skipped)
 MTSD_TO_SIGN = {
-    "regulatory--stop--g1":"stop",
-    "regulatory--yield--g1":"yield",
-    "regulatory--no-entry--g1":"no_entry",
-    "regulatory--maximum-speed-limit-20--g1":"speed_limit_sign",
-    "regulatory--maximum-speed-limit-30--g1":"speed_limit_sign",
-    "regulatory--maximum-speed-limit-40--g1":"speed_limit_sign",
-    "regulatory--maximum-speed-limit-50--g1":"speed_limit_sign",
-    "regulatory--maximum-speed-limit-60--g1":"speed_limit_sign",
-    "regulatory--maximum-speed-limit-70--g1":"speed_limit_sign",
-    "regulatory--maximum-speed-limit-80--g1":"speed_limit_sign",
-    "information--pedestrians-crossing--g1":"pedestrian_crossing_sign",
-    "regulatory--keep-right--g1":"keep_right",
-    "regulatory--keep-right--g4":"keep_right",
-    "regulatory--keep-left--g1":"keep_left",
-    "regulatory--roundabout--g1":"roundabout",
-    "regulatory--no-left-turn--g1":"no_left_turn",
-    "regulatory--no-right-turn--g1":"no_right_turn",
-    "regulatory--no-u-turn--g1":"no_u_turn",
-    "regulatory--turn-right--g1":"turn_right",
-    "regulatory--go-straight--g1":"go_straight",
-    "regulatory--one-way-straight--g1":"go_straight",
-    "regulatory--one-way-left--g1":"one_way",
-    "regulatory--one-way-left--g3":"one_way",
-    "regulatory--one-way-right--g3":"one_way",
-    "regulatory--no-parking--g1":"no_parking",
-    "regulatory--no-parking--g2":"no_parking",
-    "regulatory--no-parking--g5":"no_parking",
-    "regulatory--no-stopping--g2":"no_stopping",
-    "regulatory--no-stopping--g15":"no_stopping",
-    "regulatory--priority-road--g4":"priority_road",
-    "regulatory--height-limit--g1":"height_limit",
-    "warning--children--g2":"children_crossing",
-    "warning--road-bump--g1":"road_bump",
-    "warning--road-bump--g2":"road_bump",
-    "warning--curve-left--g2":"curve_left",
-    "warning--curve-right--g2":"curve_right",
-    "warning--roadworks--g1":"roadworks",
-    "information--parking--g1":"parking_info",
-    "regulatory--bicycles-only--g1":"bicycles_only",
-    "other-sign":"other_sign",
+    # Core regulatory
+    "regulatory--stop--g1": "stop",
+    "regulatory--stop--g2": "stop",
+    "regulatory--stop--g10": "stop",
+
+    "regulatory--yield--g1": "yield",
+    "regulatory--no-entry--g1": "no_entry",
+
+    # Speed limits → one class
+    "regulatory--maximum-speed-limit-5--g1": "speed_limit_sign",
+    "regulatory--maximum-speed-limit-10--g1": "speed_limit_sign",
+    "regulatory--maximum-speed-limit-20--g1": "speed_limit_sign",
+    "regulatory--maximum-speed-limit-25--g1": "speed_limit_sign",
+    "regulatory--maximum-speed-limit-25--g2": "speed_limit_sign",
+    "regulatory--maximum-speed-limit-30--g1": "speed_limit_sign",
+    "regulatory--maximum-speed-limit-30--g3": "speed_limit_sign",
+    "regulatory--maximum-speed-limit-35--g2": "speed_limit_sign",
+    "regulatory--maximum-speed-limit-40--g1": "speed_limit_sign",
+    "regulatory--maximum-speed-limit-40--g3": "speed_limit_sign",
+    "regulatory--maximum-speed-limit-40--g6": "speed_limit_sign",
+    "regulatory--maximum-speed-limit-45--g1": "speed_limit_sign",
+    "regulatory--maximum-speed-limit-45--g3": "speed_limit_sign",
+    "regulatory--maximum-speed-limit-50--g1": "speed_limit_sign",
+    "regulatory--maximum-speed-limit-50--g6": "speed_limit_sign",
+    "regulatory--maximum-speed-limit-55--g2": "speed_limit_sign",
+    "regulatory--maximum-speed-limit-60--g1": "speed_limit_sign",
+    "regulatory--maximum-speed-limit-65--g2": "speed_limit_sign",
+    "regulatory--maximum-speed-limit-70--g1": "speed_limit_sign",
+    "regulatory--maximum-speed-limit-80--g1": "speed_limit_sign",
+    "regulatory--maximum-speed-limit-90--g1": "speed_limit_sign",
+    "regulatory--maximum-speed-limit-100--g1": "speed_limit_sign",
+    "regulatory--maximum-speed-limit-100--g3": "speed_limit_sign",
+    "regulatory--maximum-speed-limit-110--g1": "speed_limit_sign",
+    "regulatory--maximum-speed-limit-120--g1": "speed_limit_sign",
+    "regulatory--maximum-speed-limit-led-60--g1": "speed_limit_sign",
+    "regulatory--maximum-speed-limit-led-80--g1": "speed_limit_sign",
+    "regulatory--maximum-speed-limit-led-100--g1": "speed_limit_sign",
+
+    # Keep / roundabout / one-way / go-straight
+    "regulatory--keep-right--g1": "keep_right",
+    "regulatory--keep-right--g2": "keep_right",
+    "regulatory--keep-right--g4": "keep_right",
+    "regulatory--keep-right--g6": "keep_right",
+    "regulatory--keep-left--g1": "keep_left",
+    "regulatory--keep-left--g2": "keep_left",
+
+    "regulatory--roundabout--g1": "roundabout",
+    "regulatory--roundabout--g2": "roundabout",
+    "warning--roundabout--g1": "roundabout",
+    "warning--roundabout--g25": "roundabout",
+
+    "regulatory--one-way-left--g1": "one_way",
+    "regulatory--one-way-left--g2": "one_way",
+    "regulatory--one-way-left--g3": "one_way",
+    "regulatory--one-way-right--g1": "one_way",
+    "regulatory--one-way-right--g2": "one_way",
+    "regulatory--one-way-right--g3": "one_way",
+
+    "regulatory--go-straight--g1": "go_straight",
+    "regulatory--go-straight--g3": "go_straight",
+    "regulatory--one-way-straight--g1": "go_straight",
+
+    # Turn prohibitions / directions
+    "regulatory--no-left-turn--g1": "no_left_turn",
+    "regulatory--no-left-turn--g2": "no_left_turn",
+    "regulatory--no-left-turn--g3": "no_left_turn",
+    "regulatory--no-right-turn--g1": "no_right_turn",
+    "regulatory--no-right-turn--g2": "no_right_turn",
+    "regulatory--no-right-turn--g3": "no_right_turn",
+    "regulatory--no-u-turn--g1": "no_u_turn",
+    "regulatory--no-u-turn--g2": "no_u_turn",
+    "regulatory--no-u-turn--g3": "no_u_turn",
+
+    "regulatory--turn-left--g1": "turn_left",
+    "regulatory--turn-left--g2": "turn_left",
+    "regulatory--turn-left--g3": "turn_left",
+    "regulatory--turn-left-ahead--g1": "turn_left",
+
+    "regulatory--turn-right--g1": "turn_right",
+    "regulatory--turn-right--g2": "turn_right",
+    "regulatory--turn-right--g3": "turn_right",
+    "regulatory--turn-right-ahead--g1": "turn_right",
+    "regulatory--turn-right-ahead--g2": "turn_right",
+
+    # Pedestrian crossing (info + warning variants)
+    "information--pedestrians-crossing--g1": "pedestrian_crossing_sign",
+    "information--pedestrians-crossing--g2": "pedestrian_crossing_sign",
+    "warning--pedestrians-crossing--g1": "pedestrian_crossing_sign",
+    "warning--pedestrians-crossing--g4": "pedestrian_crossing_sign",
+    "warning--pedestrians-crossing--g5": "pedestrian_crossing_sign",
+    "warning--pedestrians-crossing--g9": "pedestrian_crossing_sign",
+    "warning--pedestrians-crossing--g10": "pedestrian_crossing_sign",
+    "warning--pedestrians-crossing--g11": "pedestrian_crossing_sign",
+    "warning--pedestrians-crossing--g12": "pedestrian_crossing_sign",
+
+    # Children crossing
+    "warning--children--g1": "children_crossing",
+    "warning--children--g2": "children_crossing",
+    "information--children--g1": "children_crossing",
+
+    # Curves (left/right) – related variants
+    "warning--curve-left--g1": "curve_left",
+    "warning--curve-left--g2": "curve_left",
+    "warning--horizontal-alignment-left--g1": "curve_left",
+    "warning--hairpin-curve-left--g1": "curve_left",
+    "warning--hairpin-curve-left--g3": "curve_left",
+    "warning--double-curve-first-left--g1": "curve_left",
+    "warning--double-curve-first-left--g2": "curve_left",
+    "warning--winding-road-first-left--g2": "curve_left",
+
+    "warning--curve-right--g1": "curve_right",
+    "warning--curve-right--g2": "curve_right",
+    "warning--horizontal-alignment-right--g1": "curve_right",
+    "warning--horizontal-alignment-right--g3": "curve_right",
+    "warning--hairpin-curve-right--g4": "curve_right",
+    "warning--double-curve-first-right--g1": "curve_right",
+    "warning--double-curve-first-right--g2": "curve_right",
+    "warning--winding-road-first-right--g1": "curve_right",
+
+    # Pass either side
+    "regulatory--pass-on-either-side--g1": "pass_either_side",
+    "regulatory--pass-on-either-side--g2": "pass_either_side",
+    "warning--pass-left-or-right--g1": "pass_either_side",
+    "warning--pass-left-or-right--g2": "pass_either_side",
 }
 
 def mtsd_find_image(stem: str):
@@ -154,7 +236,6 @@ def convert_mtsd(limit=None, debug=False, args=None):
     if MTSD_ANN_DIR is None or not MTSD_ANN_DIR.exists():
         print(f"MTSD: annotations not found; looked for 'mtsd_v2_fully_annotated/annotations'. Skipping.")
         return
-
     if not MTSD_IMG_ROOTS:
         print(f"MTSD: no 'mtsd_fully_annotated_images*' volumes found. Skipping.")
         return
@@ -184,16 +265,17 @@ def convert_mtsd(limit=None, debug=False, args=None):
         lines = []
         for obj in objs:
             lab = obj.get("label") or obj.get("classTitle") or obj.get("category") or ""
-            if not isinstance(lab, str): continue
+            if not isinstance(lab, str):
+                continue
             lab = lab.strip()
-            if args and getattr(args, "mtsd_drop_other_sign", False) and lab == "other-sign":
+            canon = MTSD_TO_SIGN.get(lab)  # None if unmapped
+            if not canon:
                 continue
-            if args and getattr(args, "mtsd_drop_complementary", False) and lab.startswith("complementary--"):
+            if canon not in CLASS_TO_ID:
                 continue
-            canon = MTSD_TO_SIGN.get(lab, "other_sign")
-            if canon not in CLASS_TO_ID: continue
             bb = parse_bbox_generic(obj)
-            if not bb: continue
+            if not bb:
+                continue
             x1,y1,x2,y2 = bb
             x1 = max(0, min(x1, W-1)); x2 = max(0, min(x2, W-1))
             y1 = max(0, min(y1, H-1)); y2 = max(0, min(y2, H-1))
@@ -202,7 +284,8 @@ def convert_mtsd(limit=None, debug=False, args=None):
             lines.append(yolo_line(CLASS_TO_ID[canon], x1,y1,x2,y2, W,H))
             cov[canon]+=1
 
-        if not lines: continue
+        if not lines:
+            continue
         out_img = OUT/"images"/split/img_path.name
         out_lbl = OUT/"labels"/split/(img_path.stem + ".txt")
         copy_image(img_path, out_img)
@@ -223,10 +306,9 @@ def convert_mtsd(limit=None, debug=False, args=None):
         print("  (no boxes kept; check paths or mapping)")
 
 # ---------------------------------------------------------------------
-# BDD100K (road users + traffic lights [+ optional traffic signs])
+# BDD100K (road users + traffic lights; STRICT filter to person/car + TL colors)
 # ---------------------------------------------------------------------
 def bdd_get_objects(record: dict):
-    # Support both older "frames" and flatter "objects"/"labels"
     if "frames" in record and record["frames"]:
         return record["frames"][0].get("objects", [])
     if "objects" in record:
@@ -235,7 +317,7 @@ def bdd_get_objects(record: dict):
         return record["labels"]
     return []
 
-def convert_bdd(limit=None, include_bdd_signs_as_other=True, debug=False):
+def convert_bdd(limit=None, debug=False):
     ensure_det_dirs()
     bdd_root = RAW / "bdd100k"
     img_root = bdd_root / "images"
@@ -245,15 +327,12 @@ def convert_bdd(limit=None, include_bdd_signs_as_other=True, debug=False):
         return
 
     cov = Counter(); wrote = Counter(); boxes = Counter()
+
+    # Only these categories from BDD:
     cat_map = {
-        "person":"person",
-        "rider":"person",   # treat rider as person
-        "bike":"bicycle",
-        "motor":"motorcycle",
-        "car":"car",
-        "truck":"truck",
-        "bus":"bus",
-        # 'train' not in our CLASSES — skip
+        "person": "person",
+        "rider":  "person",  # treat riders as person (remove this line if undesired)
+        "car":    "car",
     }
 
     for split in ("train","val","test"):
@@ -291,20 +370,18 @@ def convert_bdd(limit=None, include_bdd_signs_as_other=True, debug=False):
                 # traffic light with color
                 if cat == "traffic light":
                     color = obj.get("attributes",{}).get("trafficLightColor","none")
-                    if color == "red":    cls = "traffic_light_red"
+                    if color == "red":      cls = "traffic_light_red"
                     elif color == "yellow": cls = "traffic_light_yellow"
                     elif color == "green":  cls = "traffic_light_green"
-                    else: continue  # skip 'none'
+                    else: continue  # skip 'none' / unknown
                 elif cat == "traffic sign":
-                    if not include_bdd_signs_as_other:
-                        continue
-                    cls = "other_sign"
+                    # ALWAYS skip BDD signs (MTSD supplies sign types)
+                    continue
                 else:
                     cls = cat_map.get(cat)
                     if cls is None:
                         continue
 
-                # bbox
                 bb = obj.get("box2d")
                 if not bb or not {"x1","y1","x2","y2"} <= set(bb.keys()):
                     continue
@@ -314,6 +391,8 @@ def convert_bdd(limit=None, include_bdd_signs_as_other=True, debug=False):
                 if x2<=x1 or y2<=y1: continue
                 if (x2-x1)<2 or (y2-y1)<2: continue
 
+                if cls not in CLASS_TO_ID:
+                    continue
                 lines.append(yolo_line(CLASS_TO_ID[cls], x1,y1,x2,y2, W,H))
                 cov[cls]+=1
 
@@ -422,17 +501,9 @@ def main():
     ap.add_argument("--clean", action="store_true", help="remove datasets/traffic/images and labels before writing")
     ap.add_argument("--limit_mtsd", type=int, default=None, help="limit MTSD JSONs")
     ap.add_argument("--limit_bdd", type=int, default=None, help="limit BDD JSONs per split")
-    ap.add_argument("--skip_bdd_signs", action="store_true",
-                    help="do not use BDD 'traffic sign' boxes (MTSD will supply sign types)")
     ap.add_argument("--export_lanes", action="store_true", help="also export BDD lane masks")
     ap.add_argument("--lanes_out", type=str, default=str(PROJECT_ROOT / "datasets" / "lanes"),
                     help="lane masks output folder")
-    
-    ap.add_argument("--mtsd_drop_other_sign", action="store_true",
-                help="Do not include MTSD 'other-sign' boxes.")
-    ap.add_argument("--mtsd_drop_complementary", action="store_true",
-                help="Drop MTSD labels starting with 'complementary--' (supplementary plates).")
-
     ap.add_argument("--debug", action="store_true", help="verbose logs")
     args = ap.parse_args()
 
@@ -441,14 +512,14 @@ def main():
             if d.exists(): shutil.rmtree(d)
         print("Cleaned datasets/traffic/{images,labels}")
 
-    print("Converting MTSD (signs)...")
+    print("Converting MTSD (signs)…")
     convert_mtsd(limit=args.limit_mtsd, debug=args.debug, args=args)
 
-    print("Converting BDD100K (road users + traffic lights)...")
-    convert_bdd(limit=args.limit_bdd, include_bdd_signs_as_other=not args.skip_bdd_signs, debug=args.debug)
+    print("Converting BDD100K (person/car + traffic light colors only)…")
+    convert_bdd(limit=args.limit_bdd, debug=args.debug)
 
     if args.export_lanes:
-        print("Exporting BDD100K lane masks...")
+        print("Exporting BDD100K lane masks…")
         export_bdd_lanes(Path(args.lanes_out), debug=args.debug)
 
 if __name__ == "__main__":
