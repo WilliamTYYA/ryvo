@@ -42,7 +42,8 @@ def yolo_line(cls_id, x1, y1, x2, y2, W, H) -> str:
 # Reduced to core users + lights + key signs (no other_sign / bumps / height-limit / bicycles-only)
 # ---------------------------------------------------------------------
 CLASSES = [
-    "person","car",
+    "person",
+    # "car",
     "traffic_light_red","traffic_light_yellow","traffic_light_green",
     "stop","yield","no_entry","speed_limit_sign","pedestrian_crossing_sign",
     "no_left_turn","no_right_turn","no_u_turn","one_way","turn_left","turn_right",
@@ -331,8 +332,8 @@ def convert_bdd(limit=None, debug=False):
     # Only these categories from BDD:
     cat_map = {
         "person": "person",
-        "rider":  "person",  # treat riders as person (remove this line if undesired)
-        "car":    "car",
+        # "rider":  "person",  # treat riders as person (remove this line if undesired)
+        # "car":    "car",
     }
 
     for split in ("train","val","test"):
