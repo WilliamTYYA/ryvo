@@ -435,105 +435,113 @@ def cmd_paste(args):
     out_labels.mkdir(parents=True, exist_ok=True)
 
     # Load sticker inventory per class
-    inv = {c:sorted((stickers_root/c).glob("*.png")) for c in CLASSES if (stickers_root/c).exists()}
-    inv = {k:v for k,v in inv.items() if len(v)>0}
+    inv = {c: sorted((stickers_root / c).glob("*.png")) for c in CLASSES if (stickers_root / c).exists()}
+    inv = {k: v for k, v in inv.items() if len(v) > 0}
     if not inv:
         print("[ERR] No stickers found. Run build-stickers first.")
         return
 
-    # Background list
-    bg_list = sorted(sum([glob(str(in_images/"*.jpg")),
-                          glob(str(in_images/"*.png")),
-                          glob(str(in_images/"*.JPG")),
-                          glob(str(in_images/"*.PNG"))], []))
+    # Background list (flat folder)
+    bg_list = sorted(
+        sum(
+            [
+                glob(str(in_images / "*.jpg")),
+                glob(str(in_images / "*.png")),
+                glob(str(in_images / "*.JPG")),
+                glob(str(in_images / "*.PNG")),
+            ],
+            [],
+        )
+    )
+    if args.limit and args.limit > 0:
+        bg_list = bg_list[: args.limit]
 
-    if args.limit and args.limit>0:
-        bg_list = bg_list[:args.limit]
-
-    rng = random.Random(args.seed)
-    made = 0
-    sign_count = 0
-
-    # Prepare class sampling weights (inverse-freq-ish)
-    class_weights = {}
-    for c in inv:
-        # prefer rarer classes a bit more if desired; here uniform
-        class_weights[c] = 1.0
+    # Class sampling weights (uniform)
+    class_weights = {c: 1.0 for c in inv.keys()}
     keys = list(class_weights.keys())
     weights = np.array([class_weights[k] for k in keys], dtype=np.float32)
-    weights = (weights / weights.sum()).tolist()
+    weights = (weights / max(weights.sum(), 1e-9)).tolist()
+
+    made = 0
+    pasted_boxes = 0
 
     for i, imgp in enumerate(bg_list, 1):
         imgp = Path(imgp)
         lblp = in_labels / (imgp.stem + ".txt")
 
+        # Load background once
         try:
-            bg_rgb = Image.open(imgp).convert("RGB")
+            base_bg_rgb = Image.open(imgp).convert("RGB")
         except Exception:
             continue
-        W,H = bg_rgb.size
+        W, H = base_bg_rgb.size
 
-        # Start with RGBA canvas
-        bg = bg_rgb.convert("RGBA")
-
-        # Read existing labels (preserve)
+        # Preserve existing labels
         existing = _read_yolo_labels(lblp)
-        out_lines = []
-        for (c, cx,cy,bw,bh) in existing:
-            out_lines.append(f"{c} {cx:.6f} {cy:.6f} {bw:.6f} {bh:.6f}\n")
+        existing_lines = [f"{c} {cx:.6f} {cy:.6f} {bw:.6f} {bh:.6f}\n" for (c, cx, cy, bw, bh) in existing]
 
-        n_to_add = max(0, int(args.per_image))
-        n_to_add = rng.randint(0, max(n_to_add,1)) if args.randomize else n_to_add
-        n_to_add = min(n_to_add, args.max_paste)
+        copies = max(1, int(getattr(args, "copies_per_bg", 1)))
+        for cidx in range(copies):
+            # Fresh canvas for each copy
+            bg = base_bg_rgb.copy().convert("RGBA")
 
-        for _ in range(n_to_add):
-            # choose class & sticker
-            cls = rng.choices(keys, weights=weights, k=1)[0]
-            if cls not in CLASS_TO_ID: continue
-            st_list = inv[cls]
-            if not st_list: continue
-            st_path = rng.choice(st_list)
+            # Per-copy RNG so results change even with same --seed
+            rng = random.Random(args.seed * 1000003 + i * 10007 + cidx)
 
-            try:
-                st = Image.open(st_path).convert("RGBA")
-            except Exception:
-                continue
+            # Decide how many stickers to add to this copy
+            n_to_add = max(0, int(args.per_image))
+            if args.randomize:
+                n_to_add = rng.randint(0, max(n_to_add, 1))
+            n_to_add = min(n_to_add, int(args.max_paste))
 
-            # target width: small in frame
-            short_side = min(W,H)
-            target_w = int(short_side * rng.uniform(0.035, 0.12))
+            out_lines = existing_lines.copy()
 
-            # plausible roadside placement
-            if rng.random() < 0.5:
-                # right shoulder zone
-                x = int(rng.uniform(W*0.55, W*0.92))
-            else:
-                # left shoulder zone
-                x = int(rng.uniform(W*0.08, W*0.45))
-            y = int(rng.uniform(H*0.30, H*0.78))
+            for _ in range(n_to_add):
+                # Pick class & sticker
+                cls = rng.choices(keys, weights=weights, k=1)[0]
+                if cls not in CLASS_TO_ID:
+                    continue
+                st_list = inv.get(cls, [])
+                if not st_list:
+                    continue
+                st_path = rng.choice(st_list)
+                try:
+                    st = Image.open(st_path).convert("RGBA")
+                except Exception:
+                    continue
 
-            bbox = _paste_once(bg, st, target_w, (x, y))
-            if not bbox: 
-                continue
-            x1,y1,x2,y2 = bbox
-            out_lines.append(_yolo_line(CLASS_TO_ID[cls], x1,y1,x2,y2, W,H))
-            sign_count += 1
+                # Scale sticker relative to frame
+                short_side = min(W, H)
+                target_w = int(short_side * rng.uniform(0.035, 0.12))
 
-        # Slight JPEG noise to the result (simulates camera/compression)
-        final_rgb = _jpeg_noise(bg, quality_range=(76, 92))
+                # Plausible roadside placement (left/right shoulder bands & vertical band)
+                if rng.random() < 0.5:
+                    x = int(rng.uniform(W * 0.55, W * 0.92))  # right
+                else:
+                    x = int(rng.uniform(W * 0.08, W * 0.45))  # left
+                y = int(rng.uniform(H * 0.30, H * 0.78))
 
-        # Save image & labels (don’t overwrite originals)
-        out_imgp = out_images / f"{imgp.stem}_syn.jpg"
-        out_lblp = out_labels / f"{imgp.stem}_syn.txt"
-        final_rgb.save(out_imgp, quality=92)
-        _write_yolo_labels(out_lblp, out_lines)
-        made += 1
+                bbox = _paste_once(bg, st, target_w, (x, y))
+                if not bbox:
+                    continue
+
+                x1, y1, x2, y2 = bbox
+                out_lines.append(_yolo_line(CLASS_TO_ID[cls], x1, y1, x2, y2, W, H))
+                pasted_boxes += 1
+
+            # JPEG noise and save with unique suffix per copy
+            final_rgb = _jpeg_noise(bg, quality_range=(76, 92))
+            out_imgp = out_images / f"{imgp.stem}_syn{cidx:02d}.jpg"
+            out_lblp = out_labels / f"{imgp.stem}_syn{cidx:02d}.txt"
+            final_rgb.save(out_imgp, quality=92)
+            _write_yolo_labels(out_lblp, out_lines)
+            made += 1
 
         if i % 500 == 0:
-            print(f"[{i}/{len(bg_list)}] synthesized={made}, pasted_sign_boxes={sign_count}")
+            print(f"[{i}/{len(bg_list)}] variants={made}, pasted_boxes={pasted_boxes}")
 
     print(f"[done] synthesized {made} images to {out_images}")
-    print(f"       pasted sign boxes: {sign_count}")
+    print(f"       pasted sign boxes: {pasted_boxes}")
 
 # --------------------
 # CLI
@@ -559,6 +567,10 @@ def main():
     b.add_argument("--limit", type=int, default=None)
     b.add_argument("--seed", type=int, default=42)
     b.add_argument("--randomize", action="store_true", help="randomize count per image (0..per_image)")
+
+    # in main() -> paste subparser
+    b.add_argument("--copies_per_bg", type=int, default=1,
+               help="# of synthetic variants to produce per background image")
 
     args = ap.parse_args()
     if args.cmd == "build-stickers":
