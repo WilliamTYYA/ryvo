@@ -1,18 +1,13 @@
-# Root of the dataset (this file sits in your repo root)
+# Root of the dataset (adjust 'path' if needed)
 path: .
 
 train: images/train
 val: images/val
 test: images/test
 
-nc: 37
+nc: 23
 names:
   - person
-  - bicycle
-  - car
-  - motorcycle
-  - bus
-  - truck
   - traffic_light_red
   - traffic_light_yellow
   - traffic_light_green
@@ -32,15 +27,6 @@ names:
   - keep_right
   - keep_left
   - pass_either_side
-  - priority_road
-  - no_parking
-  - no_stopping
-  - height_limit
   - children_crossing
-  - road_bump
   - curve_left
   - curve_right
-  - roadworks
-  - parking_info
-  - bicycles_only
-  - other_sign
