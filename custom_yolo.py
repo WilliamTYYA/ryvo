@@ -9,9 +9,6 @@ import tensorflow as tf
 from tensorflow import keras
 from tensorflow.keras import layers
 
-from tensorflow.keras import mixed_precision
-mixed_precision.set_global_policy("mixed_float16")
-
 AUTOTUNE = tf.data.AUTOTUNE
 
 # ---------- util: robust LR setter ----------

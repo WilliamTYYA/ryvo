@@ -1,4 +1,6 @@
 import argparse
+from tensorflow.keras import mixed_precision
+mixed_precision.set_global_policy("mixed_float16")  # enable AMP early
 from custom_yolo import train_cli
 
 def main():
