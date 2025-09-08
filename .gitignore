@@ -5,7 +5,8 @@ datasets/raw
 tmp_savedmodel_for_coreml/
 synth/
 datasets/traffic_syn/
-datasets/traffic_mix/
+datasets/traffic_mix/images/
+datasets/traffic_mix/labels/
 
 # Python cache
 __pycache__/

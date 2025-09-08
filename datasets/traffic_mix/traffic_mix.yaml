@@ -1,0 +1,32 @@
+# datasets/traffic_mix/traffic.yaml
+path: .           # because this file is inside datasets/traffic_mix
+
+train: images/train
+val:   images/val
+test:  images/test
+
+nc: 23
+names:
+  - person
+  - traffic_light_red
+  - traffic_light_yellow
+  - traffic_light_green
+  - stop
+  - yield
+  - no_entry
+  - speed_limit_sign
+  - pedestrian_crossing_sign
+  - no_left_turn
+  - no_right_turn
+  - no_u_turn
+  - one_way
+  - turn_left
+  - turn_right
+  - go_straight
+  - roundabout
+  - keep_right
+  - keep_left
+  - pass_either_side
+  - children_crossing
+  - curve_left
+  - curve_right
