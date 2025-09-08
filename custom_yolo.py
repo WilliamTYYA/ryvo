@@ -9,6 +9,9 @@ import tensorflow as tf
 from tensorflow import keras
 from tensorflow.keras import layers
 
+from tensorflow.keras import mixed_precision
+mixed_precision.set_global_policy("mixed_float16")
+
 AUTOTUNE = tf.data.AUTOTUNE
 
 # ---------- util: robust LR setter ----------
@@ -123,12 +126,23 @@ def make_dataset(pairs, img_size: int, grid_size: int, num_classes: int,
     if shuffle:
         ds = ds.shuffle(max(1, min(8192, len(pairs))), reshuffle_each_iteration=True)
 
+    # def _map(img_p, lbl_p):
+    #     flip_flag = tf.cast(tf.less(tf.random.uniform((), 0, 1), 0.5), tf.int32) if shuffle else tf.constant(0, tf.int32)
+    #     img = decode_resize_image(img_p, img_size)
+    #     if shuffle: img = hsv_jitter(img)
+    #     img = tf.cond(tf.equal(flip_flag, 1), lambda: tf.image.flip_left_right(img), lambda: img)
+    #     y = encode_labels_multi(lbl_p, grid_size, num_classes, flip_flag)  # dict {'out_m':..., 'out_s':...}
+    #     return img, y
+
     def _map(img_p, lbl_p):
-        flip_flag = tf.cast(tf.less(tf.random.uniform((), 0, 1), 0.5), tf.int32) if shuffle else tf.constant(0, tf.int32)
+        # Disable flips to keep left/right semantics correct
+        flip_flag = tf.constant(0, tf.int32)
         img = decode_resize_image(img_p, img_size)
-        if shuffle: img = hsv_jitter(img)
-        img = tf.cond(tf.equal(flip_flag, 1), lambda: tf.image.flip_left_right(img), lambda: img)
-        y = encode_labels_multi(lbl_p, grid_size, num_classes, flip_flag)  # dict {'out_m':..., 'out_s':...}
+        if shuffle:
+            img = hsv_jitter(img)
+        # DO NOT flip the image anymore
+        # img = tf.cond(tf.equal(flip_flag, 1), lambda: tf.image.flip_left_right(img), lambda: img)
+        y = encode_labels_multi(lbl_p, grid_size, num_classes, flip_flag)  # flip_flag=0 → labels unchanged
         return img, y
 
     ds = ds.map(_map, num_parallel_calls=AUTOTUNE)
@@ -447,9 +461,12 @@ def train_cli(yaml_path: str,
     print("Saved models to:", {"best": ckpt_path, "final": final_path})
 
 if __name__ == "__main__":
-    yaml_path = "datasets/traffic/traffic.yaml"
-    train_cli(yaml_path, img_size=512, grid_size=16, batch=32, epochs=5,
-              cache=False, limit=1000, sched="cosine",
-              lr0=1e-3, lrf=0.01, warmup_epochs=3.0,
-              max_lr=1e-3, div_factor=25.0, final_div_factor=1e4, pct_start=0.3,
-              patience=8, optimizer_name="adamw", weight_decay=1e-2)
+    yaml_path = "datasets/traffic_mix/traffic.yaml"
+    train_cli(
+        yaml_path, img_size=512, grid_size=16, batch=32, epochs=5,
+        cache=False, limit=None,  # use all data by default
+        sched="cosine",
+        lr0=1e-3, lrf=0.01, warmup_epochs=3.0,
+        max_lr=1e-3, div_factor=25.0, final_div_factor=1e4, pct_start=0.3,
+        patience=8, optimizer_name="adamw", weight_decay=1e-2
+    )
