@@ -1,0 +1,120 @@
+{
+    "description": "",
+    "tags": [
+        {
+            "id": 17658110,
+            "tagId": 30141,
+            "name": "2015-05-29-15-29-39_arastradero_traffic_light_loop_bag",
+            "value": null,
+            "labelerLogin": "inbox@datasetninja.com",
+            "createdAt": "2024-02-12T13:29:58.575Z",
+            "updatedAt": "2024-02-12T13:29:58.575Z"
+        }
+    ],
+    "size": {
+        "height": 720,
+        "width": 1280
+    },
+    "objects": [
+        {
+            "id": 146874848,
+            "classId": 6516811,
+            "objectId": null,
+            "description": "",
+            "geometryType": "rectangle",
+            "labelerLogin": "inbox@datasetninja.com",
+            "createdAt": "2024-02-12T13:29:58.577Z",
+            "updatedAt": "2024-02-12T13:29:58.577Z",
+            "tags": [],
+            "classTitle": "red",
+            "points": {
+                "exterior": [
+                    [
+                        879,
+                        323
+                    ],
+                    [
+                        886,
+                        339
+                    ]
+                ],
+                "interior": []
+            }
+        },
+        {
+            "id": 146874847,
+            "classId": 6516811,
+            "objectId": null,
+            "description": "",
+            "geometryType": "rectangle",
+            "labelerLogin": "inbox@datasetninja.com",
+            "createdAt": "2024-02-12T13:29:58.576Z",
+            "updatedAt": "2024-02-12T13:29:58.576Z",
+            "tags": [],
+            "classTitle": "red",
+            "points": {
+                "exterior": [
+                    [
+                        775,
+                        306
+                    ],
+                    [
+                        781,
+                        319
+                    ]
+                ],
+                "interior": []
+            }
+        },
+        {
+            "id": 146874846,
+            "classId": 6516811,
+            "objectId": null,
+            "description": "",
+            "geometryType": "rectangle",
+            "labelerLogin": "inbox@datasetninja.com",
+            "createdAt": "2024-02-12T13:29:58.576Z",
+            "updatedAt": "2024-02-12T13:29:58.576Z",
+            "tags": [],
+            "classTitle": "red",
+            "points": {
+                "exterior": [
+                    [
+                        727,
+                        302
+                    ],
+                    [
+                        732,
+                        315
+                    ]
+                ],
+                "interior": []
+            }
+        },
+        {
+            "id": 146874845,
+            "classId": 6516811,
+            "objectId": null,
+            "description": "",
+            "geometryType": "rectangle",
+            "labelerLogin": "inbox@datasetninja.com",
+            "createdAt": "2024-02-12T13:29:58.576Z",
+            "updatedAt": "2024-02-12T13:29:58.576Z",
+            "tags": [],
+            "classTitle": "red",
+            "points": {
+                "exterior": [
+                    [
+                        660,
+                        298
+                    ],
+                    [
+                        665,
+                        311
+                    ]
+                ],
+                "interior": []
+            }
+        }
+    ]
+}
